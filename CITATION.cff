@@ -15,7 +15,7 @@ abstract: >-
   regulated payment flows. Data-minimised by design: only digest,
   signature, and certificate identifiers traverse the supervisory
   chain — no transaction payload content is exposed to the supervisor.
-version: "1.0.0"
+version: "1.1.0"
 date-released: "2026-05-01"
 license: MIT
 repository-code: "https://github.com/niklasgillstrom/railgate"
@@ -25,11 +25,14 @@ authors:
     orcid: "https://orcid.org/0009-0001-6485-4596"
 identifiers:
   - type: doi
+    value: "10.5281/zenodo.19952991"
+    description: "Concept DOI — resolves to the latest version of railgate."
+  - type: doi
     value: "10.5281/zenodo.19930310"
-    description: "Companion: hsm — HSM attestation verification (financial entity side)"
+    description: "Companion: hsm — HSM attestation verification (financial entity side). Concept DOI — resolves to the latest version."
   - type: doi
     value: "10.5281/zenodo.19930395"
-    description: "Companion: gatekeeper — NCA-operated certificate-issuance gate"
+    description: "Companion: gatekeeper — NCA-operated certificate-issuance gate and settlement-time signature verification. Concept DOI — resolves to the latest version."
 keywords:
   - DORA
   - settlement-layer
