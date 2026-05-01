@@ -13,7 +13,7 @@
 
     <groupId>eu.gillstrom</groupId>
     <artifactId>railgate</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
     <name>DORA Settlement-Layer Attestation Gate</name>
     <description>
         Settlement-rail enforcement component for DORA-compliant payment
