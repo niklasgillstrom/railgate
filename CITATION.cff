@@ -9,13 +9,16 @@ abstract: >-
   generalisable to TIPS, FedNow, FPS, NPP) and orchestrates deterministic
   cryptographic signature verification at settlement time. Companion
   artefact to hsm (financial-entity HSM attestation verification) and
-  gatekeeper (NCA-operated certificate-issuance gate). Together the
-  three components operationalise the quadruple-triangulation model
-  for preventive supervision over Swish utbetalning and equivalent
-  regulated payment flows. Data-minimised by design: only digest,
-  signature, and certificate identifiers traverse the supervisory
-  chain — no transaction payload content is exposed to the supervisor.
-version: "1.1.0"
+  gatekeeper (NCA-operated certificate-issuance gate and settlement-time
+  signature verification). Together the three components operationalise
+  the quadruple-triangulation model for preventive supervision over
+  Swish utbetalning and equivalent regulated payment flows. Version 1.2.0
+  brings railgate into version-sync with gatekeeper and hsm and ships
+  full peer-review and threat-model documentation. Data-minimised by
+  design: only digest, signature, and certificate identifiers traverse
+  the supervisory chain — no transaction payload content is exposed
+  to the supervisor.
+version: "1.2.0"
 date-released: "2026-05-01"
 license: MIT
 repository-code: "https://github.com/niklasgillstrom/railgate"
