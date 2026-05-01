@@ -1,0 +1,35 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: railgate
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+railgate:
+  payment-network:
+    # In production, replace with an HTTP-based client that calls Getswish AB's
+    # signature-retrieval endpoint. The in-memory mode is for the reference
+    # implementation demonstration flow and integration tests.
+    mode: in-memory
+
+  gatekeeper:
+    # Base URL of the supervisor's gatekeeper instance. railgate calls
+    # POST {base-url}/api/v1/verify with {certSerial, issuerDn, digestHex,
+    # signatureBase64} to verify each settlement.
+    base-url: http://localhost:8080
+
+  regulated:
+    # Local-instrument codes that identify regulated payments subject to
+    # railgate enforcement. In the Swedish reference deployment, "SWISH"
+    # identifies Swish utbetalning.
+    local-instrument-codes: SWISH
+
+logging:
+  level:
+    eu.gillstrom.railgate: INFO

@@ -1,0 +1,11 @@
+target/
+*.class
+*.log
+.idea/
+*.iml
+.vscode/launch.json
+.DS_Store
+
+# OWASP Dependency-Check output
+dependency-check-report.*
+.owasp-data/

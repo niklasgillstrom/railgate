@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.0.6</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>eu.gillstrom</groupId>
+    <artifactId>railgate</artifactId>
+    <version>1.0.0</version>
+    <name>DORA Settlement-Layer Attestation Gate</name>
+    <description>
+        Settlement-rail enforcement component for DORA-compliant payment
+        infrastructure. Sits at the central-bank settlement layer (RIX-INST,
+        TIPS, FedNow or equivalent) and performs deterministic cryptographic
+        signature verification at settlement time. Companion artefact to the
+        hsm reference (https://doi.org/10.5281/zenodo.19930310) and the
+        gatekeeper reference (https://doi.org/10.5281/zenodo.199303965).
+
+        Scope:
+          For each settlement request identified as a regulated payment
+          (Swish utbetalning in the Swedish reference deployment, identified
+          via PmtTpInf/LclInstrm or via the structural derivation
+          OrgId(debtor) + PrvtId(creditor)), railgate orchestrates:
+
+            (1) retrieval of the SHA-512 digest, RSA signature, and
+                certificate serial number from the payment-network operator
+                (Getswish AB in the Swedish deployment) — the digest, not
+                the payload, satisfies GDPR Art 5(1)(c) data minimisation;
+
+            (2) cryptographic verification at the supervisor's gatekeeper
+                instance via POST /api/v1/verify, returning a binary
+                {signature_valid, compliant} decision derived from the
+                stored certificate and audit-log entry;
+
+            (3) default-deny enforcement: settlements without a valid
+                cryptographic chain to a compliant gatekeeper audit entry
+                are blocked at RIX-INST level, returning a structured
+                error code to the originating bank.
+
+        Data minimisation:
+          railgate never sees, transports, or stores transaction payload
+          content (amounts, sender/receiver detail, business message). It
+          handles only cryptographic artefacts (digest, signature, cert
+          serial) and a binary verification outcome. This satisfies GDPR
+          Art 5(1)(c) and the proportionality requirement implicit in
+          DORA Art 32 supervisory data processing.
+
+        Architectural role:
+          The triple hsm + gatekeeper + railgate operationalises the
+          quadruple-triangulation model described in the companion
+          academic article. Each component answers one specific question:
+
+            hsm        — is the key HSM-bound and on-device generated?
+            gatekeeper — is the certificate-issuance compliant with
+                         structural-independence requirements, and does the
+                         signature verify against the stored public key?
+            railgate   — is settlement permitted, given the gatekeeper
+                         response and the absence of any circumvention
+                         path at the settlement rail?
+
+        Legal basis (Union law):
+          DORA Regulation (EU) 2022/2554 — Articles 6.4, 6.6, 6.10, 9, 28.4(e),
+            28(7), 30, 32 (oversight forum), 33(3) (assessment criteria),
+            35–42 (supervisory powers).
+          eIDAS Regulation (EU) 910/2014 — Articles 24–32 (qualified
+            electronic signatures and signature creation devices).
+          PSD2 Directive (EU) 2015/2366 — Articles 35–36 (non-discriminatory
+            access to payment systems).
+          GDPR Regulation (EU) 2016/679 — Article 5(1)(c) (data minimisation).
+
+        Legal basis (Swedish national law):
+          Lag (1988:1385) om Sveriges riksbank — Riksbankens uppdrag avseende
+            betalningssystem (RIX-INST).
+          Lag (2010:751) om betaltjänster — 8 kap. tillsyn av
+            betaltjänstleverantörer.
+          Förordning (2009:93) med instruktion för Finansinspektionen.
+
+        License: MIT.
+    </description>
+
+    <developers>
+        <developer>
+            <id>gillstrom</id>
+            <name>Niklas Gillström</name>
+            <url>https://orcid.org/0009-0001-6485-4596</url>
+        </developer>
+    </developers>
+
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/licenses/MIT</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!-- OpenAPI / Swagger -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>3.0.3</version>
+        </dependency>
+
+        <!-- Lombok -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Test -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>1.18.46</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.6.2</version>
+                <executions>
+                    <execution>
+                        <id>enforce-maven</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireMavenVersion>
+                                    <version>3.6.3</version>
+                                </requireMavenVersion>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.owasp</groupId>
+                <artifactId>dependency-check-maven</artifactId>
+                <version>12.2.1</version>
+                <configuration>
+                    <failBuildOnCVSS>7</failBuildOnCVSS>
+                    <formats>
+                        <format>HTML</format>
+                        <format>JSON</format>
+                    </formats>
+                    <suppressionFiles>
+                        <suppressionFile>${project.basedir}/.owasp-suppressions.xml</suppressionFile>
+                    </suppressionFiles>
+                    <nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Maven: Check for updates",
+      "type": "shell",
+      "command": "mvn versions:display-dependency-updates",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Maven: OWASP dependency-check",
+      "type": "shell",
+      "command": "mvn dependency-check:check",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Maven: clean verify",
+      "type": "shell",
+      "command": "mvn -B clean verify",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Maven: clean package",
+      "type": "shell",
+      "command": "mvn -B clean package -DskipTests",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

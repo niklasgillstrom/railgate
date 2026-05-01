@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    OWASP Dependency-Check suppression file for railgate.
+
+    Suppress entries here ONLY when a CVE is a confirmed false positive in this
+    project's threat model. Each suppression MUST include a notes field that
+    explains (a) why the CVE does not apply, and (b) the date and reviewer who
+    made the decision. Suppressions are reviewed annually as part of the DORA
+    Article 9 ICT risk management cycle.
+-->
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+
+    <suppress>
+        <notes><![CDATA[
+            DOMPurify 3.3.2 inside swagger-ui (transitive via springdoc).
+            ADD_TAGS-as-function + FORBID_TAGS interaction is the affected
+            path; Swagger UI's default config does not exercise it.
+            Reviewed: 2026-05-01.
+        ]]></notes>
+        <packageUrl regex="true">^pkg:javascript/DOMPurify@3\.3\.2$</packageUrl>
+        <cve>CVE-2026-41238</cve>
+        <cve>CVE-2026-41239</cve>
+        <cve>CVE-2026-41240</cve>
+        <vulnerabilityName regex="true">(?s).*ADD_TAGS.*FORBID_TAGS.*</vulnerabilityName>
+    </suppress>
+
+</suppressions>

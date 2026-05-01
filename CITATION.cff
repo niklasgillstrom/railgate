@@ -1,0 +1,47 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "DORA Settlement-Layer Attestation Gate"
+abstract: >-
+  Reference implementation of the settlement-rail enforcement component
+  for DORA-compliant payment infrastructure. Sits at the central-bank
+  settlement rail (RIX-INST in the Swedish reference deployment;
+  generalisable to TIPS, FedNow, FPS, NPP) and orchestrates deterministic
+  cryptographic signature verification at settlement time. Companion
+  artefact to hsm (financial-entity HSM attestation verification) and
+  gatekeeper (NCA-operated certificate-issuance gate). Together the
+  three components operationalise the quadruple-triangulation model
+  for preventive supervision over Swish utbetalning and equivalent
+  regulated payment flows. Data-minimised by design: only digest,
+  signature, and certificate identifiers traverse the supervisory
+  chain — no transaction payload content is exposed to the supervisor.
+version: "1.0.0"
+date-released: "2026-05-01"
+license: MIT
+repository-code: "https://github.com/niklasgillstrom/railgate"
+authors:
+  - family-names: "Gillström"
+    given-names: "Niklas"
+    orcid: "https://orcid.org/0009-0001-6485-4596"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.19930310"
+    description: "Companion: hsm — HSM attestation verification (financial entity side)"
+  - type: doi
+    value: "10.5281/zenodo.19930395"
+    description: "Companion: gatekeeper — NCA-operated certificate-issuance gate"
+keywords:
+  - DORA
+  - settlement-layer
+  - RIX-INST
+  - TIPS
+  - FedNow
+  - pacs.008
+  - signature-verification
+  - data-minimisation
+  - GDPR-Art-5
+  - default-deny
+  - Spring-Boot
+  - financial-supervision
+  - Finansinspektionen
+  - Riksbanken
