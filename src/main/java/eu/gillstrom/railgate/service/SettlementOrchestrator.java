@@ -102,14 +102,20 @@ public class SettlementOrchestrator {
     }
 
     private static String reasonCodeFor(VerificationResult verification) {
+        // Infrastructure failure must be tested first. GatekeeperClient signals
+        // an unreachable gatekeeper by returning signatureValid=false with
+        // reason=NETWORK_ERROR, so testing the boolean first made this branch
+        // unreachable and reported every outage to the originating bank as
+        // SIGNATURE_INVALID — an accusation of a bad signature where the real
+        // cause was that the supervisor could not be reached.
+        if ("NETWORK_ERROR".equals(verification.getReason())) {
+            return "NETWORK_ERROR";
+        }
         if (!verification.isSignatureValid()) {
             return "SIGNATURE_INVALID";
         }
         if (!verification.isCompliant()) {
             return "CERT_NON_COMPLIANT";
-        }
-        if ("NETWORK_ERROR".equals(verification.getReason())) {
-            return "NETWORK_ERROR";
         }
         return "VERIFICATION_FAILED";
     }

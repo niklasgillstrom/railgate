@@ -76,10 +76,24 @@ proportionality requirement implicit in DORA Art 32 supervisory data
 processing.
 
 SHA-512 collision resistance ensures that a valid signature over the
-digest cryptographically binds the signature to the exact transaction
-that was performed. Verification is therefore cryptographically
-deterministic — there is no semantic gap between "verifying the digest"
-and "verifying the transaction".
+digest binds that signature to the payload the digest was taken over.
+It does not, on its own, bind the signature to the pacs.008 message
+being settled: railgate receives the digest from the payment-network
+operator and does not recompute it, because `SettlementRequest` carries
+what RIX-INST delivers — a transaction reference, an instrument code and
+BICs — and not the amount, currency or counterparty identifiers the
+signature was made over. Counterparty identity is in any case resolved
+from Swish alias to IBAN by the payment-network operator before
+settlement, so the identifier the customer signed is not the identifier
+railgate sees.
+
+The residual is therefore an assumption about the payment-network
+operator, and it is not a property of the architecture. Closing it
+requires the settlement message to carry the signed fields, which is a
+participation condition for the rail rather than a change to this
+artefact: RIX terms are set by the system owner, and ISO 20022 provides
+the extension points. railgate implements what is verifiable given what
+the rail delivers today.
 
 ## Default-deny
 

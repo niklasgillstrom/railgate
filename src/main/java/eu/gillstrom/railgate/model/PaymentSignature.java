@@ -11,9 +11,14 @@ import lombok.NoArgsConstructor;
  * (Getswish AB in the Swedish reference deployment) for a given transaction.
  *
  * <p>Note that this carries only the digest, not the original transaction
- * payload. The verifier (gatekeeper) does not need to see transaction content;
- * SHA-512 collision resistance ensures that a valid signature over the digest
- * uniquely binds the signature to the exact transaction that was performed.
+ * payload. The verifier (gatekeeper) does not need to see transaction content.
+ *
+ * <p>The digest is supplied by the payment-network operator and is never
+ * recomputed here — {@code SettlementRequest} carries what RIX-INST delivers,
+ * which does not include the fields the signature was made over. A valid
+ * signature therefore binds to the payload the digest was taken over, not to
+ * the pacs.008 message being settled. See {@code README.md} for the residual
+ * assumption this leaves and what would close it.
  *
  * <p>This shape is what {@code PaymentNetworkClient} returns and what
  * {@code GatekeeperClient} forwards to gatekeeper for verification.

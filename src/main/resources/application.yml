@@ -24,6 +24,11 @@ railgate:
     # signatureBase64} to verify each settlement.
     base-url: http://localhost:8080
 
+    # Bounded waits. A settlement rail must receive a deny rather than block on
+    # an unresponsive gatekeeper. ISO-8601 durations.
+    connect-timeout: PT2S
+    read-timeout: PT5S
+
   regulated:
     # Local-instrument codes that identify regulated payments subject to
     # railgate enforcement. In the Swedish reference deployment, "SWISH"

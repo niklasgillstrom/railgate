@@ -5,8 +5,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Append-only audit record of railgate settlement decisions.
@@ -41,7 +44,21 @@ public class RailgateAuditLog {
             String gatekeeperAuditEntryId
     ) {}
 
-    private final List<AuditEntry> entries = new CopyOnWriteArrayList<>();
+    /**
+     * Bounded ring buffer.
+     *
+     * <p>{@code CopyOnWriteArrayList} copies the entire backing array on every
+     * add, so cost grew linearly with the number of settlements and the total
+     * work was quadratic — on a settlement rail, the worst possible place for
+     * it. Memory was unbounded too. A deque gives O(1) append, and the cap
+     * bounds heap use; a production deployment backs this with the
+     * tamper-evident persistent log described above rather than raising the
+     * cap.</p>
+     */
+    private static final int MAX_ENTRIES = 10_000;
+
+    private final Deque<AuditEntry> entries = new ConcurrentLinkedDeque<>();
+    private final AtomicInteger entryCount = new AtomicInteger();
 
     public void record(SettlementDecision decision) {
         AuditEntry entry = new AuditEntry(
@@ -52,7 +69,10 @@ public class RailgateAuditLog {
                 decision.getMessage(),
                 decision.getAuditEntryId()
         );
-        entries.add(entry);
+        entries.addLast(entry);
+        if (entryCount.incrementAndGet() > MAX_ENTRIES && entries.pollFirst() != null) {
+            entryCount.decrementAndGet();
+        }
 
         if (decision.isAllow()) {
             log.info("Settlement ALLOWED: ref={} reason={} gatekeeperEntry={}",
@@ -65,6 +85,6 @@ public class RailgateAuditLog {
 
     /** Returns an immutable snapshot of all audit entries (for inspection). */
     public List<AuditEntry> snapshot() {
-        return List.copyOf(entries);
+        return List.copyOf(new ArrayList<>(entries));
     }
 }

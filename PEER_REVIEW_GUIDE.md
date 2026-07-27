@@ -15,7 +15,7 @@ The three components together operationalise the data-minimised quadruple-triang
 **Is:**
 
 - A **reference implementation** of settlement-rail enforcement as described in Article 1 §4.3 and §6.2 and in Article 2 §6.1 and §9.3. Railgate sits at the central-bank settlement rail and performs deterministic cryptographic signature verification at settlement time, blocking any settlement that cannot be matched to a compliant gatekeeper audit entry.
-- A **demonstration** of the data-minimisation contract: the supervisor never sees transaction payload content, only the SHA-512 digest, the signature, and the certificate identifiers. SHA-512 collision resistance ensures the digest binds the signature to the exact transaction performed.
+- A **demonstration** of the data-minimisation contract: the supervisor never sees transaction payload content, only the SHA-512 digest, the signature, and the certificate identifiers. SHA-512 collision resistance binds the signature to the payload the digest was taken over — not, by itself, to the pacs.008 message being settled; see the note on the residual binding assumption in `README.md`.
 - A **default-deny enforcement** prototype with structured reason codes (`ALLOWED`, `DORA_32_AUDIT_MISSING`, `SIGNATURE_INVALID`, `CERT_NON_COMPLIANT`, `NETWORK_ERROR`, etc.) returned to the originating bank.
 
 **Isn't:**
@@ -25,14 +25,28 @@ The three components together operationalise the data-minimised quadruple-triang
 
 ---
 
+## Version 1.3.0 — what changed and what to verify
+
+A systematic check of the triad against its own documentation found places where a described protection was not implemented in the code. In summary:
+
+- `GatekeeperClient` had no connect or read timeout, so an unresponsive gatekeeper blocked the calling thread instead of producing a deny. Timeouts are now configurable and bounded by default.
+- A gatekeeper outage was reported to the originating bank as `SIGNATURE_INVALID`, because the `NETWORK_ERROR` branch was unreachable. Infrastructure failure and cryptographic failure are no longer conflated.
+- The audit log copied its entire backing array on every settlement decision; it is now a bounded ring buffer.
+- `GatekeeperClient` had no tests at all, which is where every fail-open risk in this repository lives. `GatekeeperClientTest` now drives the real client against a stubbed transport.
+- The claim that SHA-512 collision resistance binds the signature to the settled transaction has been corrected throughout: it binds the signature to the payload the digest was taken over. See `README.md` for the residual assumption and what would close it.
+
+Reviewers should start with `mvn -B test` (11 tests).
+
+---
+
 ## Version 1.2.0 — what changed and what to verify
 
 Reviewers approaching v1.2.0 should focus on the following:
 
 1. **Settlement-time orchestration** (`SettlementOrchestrator`) — verify the flow: regulated-payment detection → payment-network signature retrieval → gatekeeper verification → allow/default-deny.
 2. **Regulated-payment detection** (`RegulatedPaymentDetector`) — both paths must work: explicit `LclInstrm/Cd` matching (e.g. "SWISH"), and structural derivation (`OrgId(debtor)` + `PrvtId(creditor)` = organisation-to-private = Swish utbetalning). The structural path cannot be circumvented by the originating bank — the directional structure is inherent to the transaction.
-3. **Data-minimisation contract** — the JSON wire format for `SettlementRequest`, `PaymentSignature`, and the gatekeeper-bound `SignatureVerificationRequest` must contain only digest, signature, and certificate identifiers. There must be no payload field. The `SettlementOrchestratorTest` includes a dedicated assertion that exercises this contract.
-4. **Default-deny logic** — the orchestrator returns `allow = false` whenever (a) the payment-network operator has no record of the transaction, (b) the gatekeeper rejects the signature, (c) the gatekeeper marks the certificate non-compliant, or (d) the gatekeeper is unreachable. Verify each of the four paths in `SettlementOrchestratorTest`.
+3. **Data-minimisation contract** — the JSON wire format for `SettlementRequest`, `PaymentSignature`, and the gatekeeper-bound `SignatureVerificationRequest` must contain only digest, signature, and certificate identifiers. There must be no payload field. `GatekeeperClientTest.forwardsExactlyTheFourDataMinimisedFields` asserts this against the real outbound request body, including a field count so that a fifth field cannot be added without the test failing.
+4. **Default-deny logic** — the orchestrator returns `allow = false` whenever (a) the payment-network operator has no record of the transaction, (b) the gatekeeper rejects the signature, (c) the gatekeeper marks the certificate non-compliant, or (d) the gatekeeper is unreachable. Paths (a)-(c) are covered by `SettlementOrchestratorTest`; path (d) is covered by `GatekeeperClientTest`, which drives the real client against a stubbed transport (server error, empty body, unparseable body, foreign JSON) and asserts a deny in every case. Note that a gatekeeper outage is reported as `NETWORK_ERROR`, not `SIGNATURE_INVALID` — the two must not be conflated, since the latter is an accusation against the originating bank.
 
 ---
 
@@ -120,7 +134,7 @@ Railgate is operated by the central-bank settlement-rail operator (Sveriges Riks
 
 | GDPR provision | What railgate addresses |
 |---|---|
-| Art 5(1)(c) (data minimisation) | The supervisor's verification chain receives only digest, signature, and certificate identifiers — never transaction payload content. SHA-512 collision resistance binds the digest to the exact transaction performed. |
+| Art 5(1)(c) (data minimisation) | The supervisor's verification chain receives only digest, signature, and certificate identifiers — never transaction payload content. SHA-512 collision resistance binds the digest to the signed payload; binding it to the settled message would require the rail to carry the signed fields (see `README.md`). |
 
 ---
 

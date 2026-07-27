@@ -90,9 +90,11 @@
 
 ### Mitigations
 
-- **Data minimisation by design.** The contract between railgate and the gatekeeper carries only `(certSerial, issuerDn, digestHex, signatureBase64, signingCertificatePem)` — no transaction payload content. Even if an intercepting adversary obtains the full request body, they recover only the SHA-512 digest, which is one-way: the original transaction cannot be reconstructed from it.
+- **Data minimisation by design.** The contract between railgate and the gatekeeper carries only `(certSerial, issuerDn, digestHex, signatureBase64)` — no transaction payload content. Even if an intercepting adversary obtains the full request body, they recover only the SHA-512 digest, which is one-way: the original transaction cannot be reconstructed from it.
+
+- **Residual: the digest is supplied, not recomputed.** railgate verifies that the signature is valid over the digest it received; it cannot verify that the digest corresponds to the pacs.008 message being settled, because the settlement request carries a transaction reference rather than the signed fields, and because Swish aliases are resolved to IBAN by the payment-network operator before settlement. A substitution performed by that operator between signing and settlement is therefore outside what this component detects. Closing this requires the settlement message to carry the signed fields — a rail participation condition, not a change to this artefact.
 - The audit log records only the transaction reference (a UETR), the binary decision, the reason code, and the gatekeeper audit-entry identifier. No payment amounts, no sender/receiver identifiers, no business message content. An adversary reading the audit log learns only that a settlement attempt was decided, not what it was for.
-- This data-minimisation contract is enforced architecturally by the JSON wire format and by the `SettlementOrchestratorTest` data-minimisation assertion.
+- This data-minimisation contract is enforced architecturally by the JSON wire format and by `GatekeeperClientTest.forwardsExactlyTheFourDataMinimisedFields`, which asserts against the outbound request body that it carries exactly those four fields and no fifth.
 
 ### Residual risks
 

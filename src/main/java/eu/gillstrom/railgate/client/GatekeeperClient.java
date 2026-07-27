@@ -5,6 +5,7 @@ import eu.gillstrom.railgate.model.VerificationResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
@@ -13,6 +14,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -36,10 +38,35 @@ import java.util.Map;
 @Slf4j
 public class GatekeeperClient {
 
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate restTemplate;
 
     @Value("${railgate.gatekeeper.base-url:http://localhost:8080}")
     private String gatekeeperBaseUrl;
+
+    /**
+     * A settlement rail cannot wait indefinitely for the supervisor.
+     *
+     * <p>The previous {@code new RestTemplate()} used the default request
+     * factory with no connect or read timeout, so a gatekeeper that accepted
+     * the connection and then stopped responding blocked the calling thread
+     * forever. That is not fail-open — the transaction is never allowed — but
+     * it is not fail-closed either: the settlement pipeline stalls instead of
+     * receiving a deny. Bounded timeouts turn that case into the
+     * {@code NETWORK_ERROR} deny the design already describes.</p>
+     */
+    public GatekeeperClient(
+            @Value("${railgate.gatekeeper.connect-timeout:PT2S}") Duration connectTimeout,
+            @Value("${railgate.gatekeeper.read-timeout:PT5S}") Duration readTimeout) {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(connectTimeout);
+        factory.setReadTimeout(readTimeout);
+        this.restTemplate = new RestTemplate(factory);
+    }
+
+    /** For tests: inject a RestTemplate that MockRestServiceServer is bound to. */
+    GatekeeperClient(RestTemplate restTemplate) {
+        this.restTemplate = restTemplate;
+    }
 
     public VerificationResult verify(PaymentSignature signature) {
         String url = gatekeeperBaseUrl + "/api/v1/verify";
