@@ -11,19 +11,17 @@ abstract: >-
   artefact to hsm (financial-entity HSM attestation verification) and
   gatekeeper (NCA-operated certificate-issuance gate and settlement-time
   signature verification). Together the three components operationalise
-  the quadruple-triangulation model for preventive supervision over
-  Swish utbetalning and equivalent regulated payment flows. Version 1.3.0 corrects defects found when
-  the implementation was checked against its documentation: the gatekeeper client had no timeouts, so an
-  unresponsive supervisor blocked the settlement thread instead of
-  producing a deny; an outage was reported to the originating bank as
-  an invalid signature; and the claim that SHA-512 collision resistance
-  binds the signature to the settled transaction has been corrected to
-  what the component establishes — the digest is supplied by the
-  payment-network operator and is not recomputed from the settlement
-  message. Data-minimised by
-  design: only digest, signature, and certificate identifiers traverse
-  the supervisory chain — no transaction payload content is exposed
-  to the supervisor.
+  the quadruple-triangulation model for preventive supervision over Swish
+  utbetalning and equivalent regulated payment flows. Version 1.4.0 fixes
+  a start-up failure in 1.3.0 (ambiguous constructor in the gatekeeper
+  client, which had left the 1.3.0 timeout fix unreachable), treats a
+  settlement without party-type classification as regulated instead of
+  passing it through, requires https for the gatekeeper connection, turns
+  unhandled failures into a 403 deny that carries nothing from the
+  exception, and reports the gatekeeper's own reason code to the
+  originating bank. Data-minimised by design: only digest, signature, and
+  certificate identifiers traverse the supervisory chain — no transaction
+  payload content is exposed to the supervisor.
 version: "1.4.0"
 date-released: "2026-09-02"
 license: MIT
