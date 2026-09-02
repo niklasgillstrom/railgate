@@ -22,13 +22,15 @@
 
 ### Mitigations
 
-- Production deployments require mTLS between railgate and its callers, and between railgate and the gatekeeper. Spring Security's mTLS configuration restricts access to authorised central-bank-side clients and pins the gatekeeper certificate at the railgate side.
-- The orchestrator never makes its decision on the basis of trust in the caller alone. Even when the caller is a properly authenticated settlement system, the verification result depends on the gatekeeper's response, which is itself signed by the supervisor and can be independently verified by an auditor.
-- The gatekeeper's signed response is what the orchestrator allows on; a fraudulent unsigned response cannot mimic it.
+- `SecurityConfig` requires authentication on `/api/v1/**` and ships HTTP Basic as the reference mechanism. mTLS is the mechanism a central-bank deployment should use, and wiring it is the deployer's work, not something this repo performs: a truststore via `server.ssl.trust-store-*` with `server.ssl.client-auth=need`, and `.x509(...)` in place of `.httpBasic(...)` on the `/api/v1/**` chain. Until that is done, the caller is authenticated by a shared secret.
+- Outbound, `GatekeeperClient` refuses a non-`https` base URL at start-up unless `railgate.gatekeeper.allow-insecure-http=true`, so the supervisor link cannot silently be plain text. The truststore and any client certificate come from Spring Boot's standard SSL properties; the gatekeeper certificate is **not** pinned by railgate.
+- The orchestrator never makes its decision on the basis of trust in the caller alone. Even when the caller is a properly authenticated settlement system, the verification result depends on the gatekeeper's response.
+- **railgate does not verify a signature over the gatekeeper's response.** `POST /api/v1/verify` returns plain JSON and `GatekeeperClient` deserialises `signatureValid` and `compliant` from it directly. The gatekeeper signs its *receipts*, and the settlement-time verdict is not one of them. An auditor can independently verify the gatekeeper's own signed audit entry after the fact; railgate cannot verify anything about the verdict at the moment it acts on it. Earlier revisions of this document asserted that "the gatekeeper's signed response is what the orchestrator allows on" and that "a fraudulent unsigned response cannot mimic it". Neither is true of this code: an adversary who can present a TLS certificate railgate's truststore accepts, or who terminates the connection at a compromised proxy, can return `signatureValid=true, compliant=true` and railgate will allow the settlement.
 
 ### Residual risks
 
 - Compromise of the central bank's mTLS client certificate would allow an attacker to submit settlement requests as if they were from the legitimate operator. This is a standard PKI operational risk and is addressed by the central bank's own certificate-management policies.
+- Because the verdict is unsigned, the gatekeeper's TLS identity is the whole of railgate's assurance that it is talking to the gatekeeper. Closing this residual means signing the verification response — the gatekeeper already has the key material and the canonicalisation machinery for its receipts — and verifying it in `GatekeeperClient`. That is a cross-repo change to the wire contract and is not in this release.
 
 ---
 
@@ -48,8 +50,9 @@
 
 ### Mitigations
 
-- TLS protects the integrity of communication between railgate and both the payment-network operator and the gatekeeper.
+- TLS protects the integrity of communication between railgate and the gatekeeper, and `GatekeeperClient` will not start against a non-`https` base URL unless explicitly overridden. TLS is the *only* integrity protection on that link: see Spoofing above on the unsigned verdict. The payment-network operator link is not covered — `InMemoryPaymentNetworkClient` is the only implementation that ships, and the production HTTP client is a deployment extension point with its own transport configuration.
 - Cryptographic verification at the gatekeeper is performed against the digest as supplied by railgate; if the digest has been tampered with in transit, the signature verification will fail and `signatureValid=false` will be returned. The orchestrator's default-deny behaviour blocks the settlement.
+- `GatekeeperClient` rejects malformed cryptographic material before it is forwarded: the digest must be 128 hexadecimal characters, the signature must decode as base64, and the certificate serial and issuer DN must be non-blank. The result is `INVALID_SIGNATURE_MATERIAL` and a deny, which the orchestrator passes through rather than reporting as `SIGNATURE_INVALID`. This does not detect substitution of *valid* material; it stops malformed material from consuming a supervisory call and from being reported as an accusation against the originating bank.
 - For audit-log integrity, production deployments should back the in-memory `RailgateAuditLog` with a hash-chained append-only persistent log (cf. `AppendOnlyFileAuditLog` in the gatekeeper repo). This is documented as a known production extension point in the peer-review guide.
 
 ### Residual risks
@@ -73,6 +76,7 @@
 ### Residual risks
 
 - The reference implementation's audit log is not signed by railgate itself. A production deployment may want to add per-entry signing using a railgate-operator key (analogous to gatekeeper's `EphemeralReceiptSigner` / `ConfiguredReceiptSigner` pattern) so that each audit entry is independently verifiable.
+- The log is capped at 10 000 entries and discards its oldest records beyond that, so "every settlement decision is recorded" holds only within the retention window. `GET /api/v1/audit/health` reports the discarded count so that a gap is detectable rather than invisible, and the transaction reference and message are stripped of CR and LF before they are stored or logged, so an upstream value cannot forge additional lines in the operator's log.
 
 ---
 
@@ -116,9 +120,11 @@
 
 ### Mitigations
 
-- Production deployments at the central-bank rail receive only authenticated traffic via mTLS, dramatically reducing the attack surface for synthetic floods.
+- `/api/v1/**` requires authentication, so synthetic floods must first get past whatever mechanism the deployer wired in. With the shipped HTTP Basic that is a shared secret; with mTLS it is a client certificate. Either way the reduction in attack surface comes from the deployment, not from railgate.
+- **railgate has no rate limiting.** gatekeeper enforces per-principal token buckets on its endpoints; railgate has no equivalent, so an authenticated caller can issue settlement prechecks at whatever rate it likes and each one becomes an outbound gatekeeper call. Rate limiting at the rail is a reverse-proxy or gateway concern in a central-bank deployment; it is not in this code.
 - railgate's verification logic is computationally cheap (a single HTTP call to gatekeeper with a small body); per-request resource consumption is bounded.
-- For gatekeeper-side availability, production deployments should run multiple gatekeeper replicas behind a load-balancer; the `GatekeeperClient` connection-timeout and read-timeout values are configurable.
+- `GatekeeperClient` applies a connect timeout and a read timeout (`railgate.gatekeeper.connect-timeout`, `railgate.gatekeeper.read-timeout`; defaults PT2S and PT5S), so an unresponsive gatekeeper produces a `NETWORK_ERROR` deny rather than holding the calling thread. For gatekeeper-side availability, production deployments should run multiple gatekeeper replicas behind a load balancer.
+- The audit log is a bounded ring buffer (10 000 entries). Under sustained load it discards its oldest records, which is a loss of the supervisory record rather than a memory-exhaustion failure; discards are counted, reported at `GET /api/v1/audit/health`, and produce a WARN once per thousand.
 
 ### Residual risks
 
@@ -138,8 +144,10 @@
 
 ### Mitigations
 
-- Both endpoints are behind Spring Security mTLS in production deployments. The reference application configuration assumes a `SETTLEMENT_RAIL`-equivalent role at the railgate side; the deployer wires this role via mTLS principal-extraction matching the central bank's client-certificate convention.
-- The audit trail endpoint is read-only and contains no payment payload content (see Information Disclosure above), so unauthorised read of the audit trail still does not leak transaction detail.
+- `SecurityConfig` places `/api/v1/**` behind an authenticated, stateless, CSRF-exempt filter chain. Until 1.4.0 there was no `SecurityFilterChain` bean at all, so Spring Boot's default applied: session-based and CSRF-protected, which a machine caller cannot satisfy, and form login, which it cannot follow.
+- **There is no role model at the railgate side.** Every authenticated caller of `/api/v1/**` may both submit prechecks and read the audit trail; there is no `SETTLEMENT_RAIL` role, and earlier revisions of this document claimed one that the reference configuration never contained. `SETTLEMENT_RAIL` exists at the *gatekeeper*, where it authorises railgate to call `POST /api/v1/verify`. A deployer who needs to separate submission from audit read at railgate adds path matchers and a principal-to-role mapping in the manner of gatekeeper's `RoleMappingProperties`.
+- The authentication mechanism is the deployer's: HTTP Basic ships, mTLS with `.x509(...)` principal extraction is what a central-bank deployment should use.
+- The audit trail endpoint is read-only and contains no payment payload content (see Information Disclosure above), so unauthorised read of the audit trail still does not leak transaction detail. It does leak transaction references and decisions to any authenticated caller.
 
 ### Residual risks
 

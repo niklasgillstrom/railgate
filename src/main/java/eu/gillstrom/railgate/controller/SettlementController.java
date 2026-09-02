@@ -62,4 +62,20 @@ public class SettlementController {
     public ResponseEntity<List<RailgateAuditLog.AuditEntry>> audit() {
         return ResponseEntity.ok(auditLog.snapshot());
     }
+
+    /**
+     * Operational state of the bounded audit log.
+     *
+     * <p>Reports how many entries are retained, the retention cap, and how
+     * many have been discarded at that cap since start-up. A non-zero
+     * {@code evictedCount} means the supervisory record read from
+     * {@code GET /api/v1/audit} is incomplete, which is not otherwise visible
+     * from the snapshot itself.
+     *
+     * @return retained, capped and discarded counts
+     */
+    @GetMapping("/audit/health")
+    public ResponseEntity<RailgateAuditLog.AuditLogHealth> auditHealth() {
+        return ResponseEntity.ok(auditLog.health());
+    }
 }

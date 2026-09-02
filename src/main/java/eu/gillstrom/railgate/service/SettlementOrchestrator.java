@@ -12,6 +12,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Core orchestration logic for settlement-time enforcement.
@@ -48,7 +49,17 @@ public class SettlementOrchestrator {
     private final RailgateAuditLog auditLog;
 
     public SettlementDecision evaluate(SettlementRequest request) {
-        if (!detector.isRegulated(request)) {
+        // The pass-through below is the only path that yields allow=true
+        // without a gatekeeper response, so it is guarded twice: the
+        // classification must be present, and the detector must say the
+        // settlement is not regulated. RegulatedPaymentDetector already
+        // treats a missing classification as regulated; the check is
+        // repeated here so the invariant does not depend on a collaborator.
+        boolean classified = request != null
+                && request.getDebtorIsOrganization() != null
+                && request.getCreditorIsPrivatePerson() != null;
+
+        if (classified && !detector.isRegulated(request)) {
             // Non-regulated settlement: railgate has no role; pass through.
             return record(SettlementDecision.builder()
                     .allow(true)
@@ -101,22 +112,49 @@ public class SettlementOrchestrator {
         return decision;
     }
 
+    /**
+     * Reason codes that may arrive in {@link VerificationResult#getReason()}
+     * and are passed through unchanged.
+     *
+     * <p>The first four are produced by the gatekeeper. The fifth is produced
+     * by {@code GatekeeperClient} itself: {@code NETWORK_ERROR} when the
+     * supervisor could not be reached, {@code INVALID_SIGNATURE_MATERIAL}
+     * when the artefacts from the payment-network operator were malformed and
+     * the call was never made. Both describe a failure upstream of the
+     * cryptography and must not be reported as {@code SIGNATURE_INVALID},
+     * which is an accusation against the originating bank.</p>
+     */
+    private static final Set<String> PASSTHROUGH_REASONS = Set.of(
+            "CERT_NOT_FOUND",
+            "CERT_NON_COMPLIANT",
+            "SIGNATURE_INVALID",
+            "NETWORK_ERROR",
+            "INVALID_SIGNATURE_MATERIAL");
+
+    /**
+     * Maps a non-positive verification result to the reason code returned to
+     * the originating bank.
+     *
+     * <p>The gatekeeper's own reason is read first. {@code CERT_NOT_FOUND} —
+     * the certificate matches no gatekeeper audit entry, which is the
+     * circumvented-issuance case — is distinct from a certificate that exists
+     * and failed its checks, and deriving the code from the two booleans
+     * alone collapsed the two into {@code SIGNATURE_INVALID}.</p>
+     *
+     * <p>Called only when {@code !verification.isAllowed()}, so the fallback
+     * is exhaustive: either the signature did not verify, or it did and the
+     * certificate was not compliant. There is no third case, and the
+     * {@code VERIFICATION_FAILED} branch that used to sit here was
+     * unreachable.</p>
+     */
     private static String reasonCodeFor(VerificationResult verification) {
-        // Infrastructure failure must be tested first. GatekeeperClient signals
-        // an unreachable gatekeeper by returning signatureValid=false with
-        // reason=NETWORK_ERROR, so testing the boolean first made this branch
-        // unreachable and reported every outage to the originating bank as
-        // SIGNATURE_INVALID — an accusation of a bad signature where the real
-        // cause was that the supervisor could not be reached.
-        if ("NETWORK_ERROR".equals(verification.getReason())) {
-            return "NETWORK_ERROR";
+        String reason = verification.getReason();
+        if (reason != null && PASSTHROUGH_REASONS.contains(reason.trim())) {
+            return reason.trim();
         }
         if (!verification.isSignatureValid()) {
             return "SIGNATURE_INVALID";
         }
-        if (!verification.isCompliant()) {
-            return "CERT_NON_COMPLIANT";
-        }
-        return "VERIFICATION_FAILED";
+        return "CERT_NON_COMPLIANT";
     }
 }

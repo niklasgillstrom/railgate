@@ -5,10 +5,17 @@ spring:
   application:
     name: railgate
 
+# OpenAPI document and Swagger UI are off in every non-dev profile. Neither has
+# a run-time function in this service, and the UI is a third-party JavaScript
+# application (swagger-ui, DOMPurify) whose vulnerabilities would otherwise be
+# part of the deployed surface. Enable locally with --spring.profiles.active=dev
+# (application-dev.yml).
 springdoc:
   api-docs:
+    enabled: false
     path: /v3/api-docs
   swagger-ui:
+    enabled: false
     path: /swagger-ui.html
 
 railgate:
@@ -22,7 +29,21 @@ railgate:
     # Base URL of the supervisor's gatekeeper instance. railgate calls
     # POST {base-url}/api/v1/verify with {certSerial, issuerDn, digestHex,
     # signatureBase64} to verify each settlement.
-    base-url: http://localhost:8080
+    #
+    # https is required. Over plain HTTP the verification verdict is neither
+    # confidential nor integrity-protected: railgate does not verify a
+    # signature over the gatekeeper's response, so an intermediary can rewrite
+    # signatureValid and compliant to true and the settlement proceeds. The
+    # port is the conventional 8443; the gatekeeper's own TLS listener is
+    # configured on its side (server.ssl.* in gatekeeper's application.yaml)
+    # or terminated by a reverse proxy in front of it.
+    base-url: https://localhost:8443
+
+    # Escape hatch for a local development run against a gatekeeper started
+    # without TLS. Leaving this at false makes an http:// base-url a start-up
+    # failure rather than a silent downgrade. Setting it to true logs a WARN
+    # at every start-up. Never set it in a deployed configuration.
+    allow-insecure-http: false
 
     # Bounded waits. A settlement rail must receive a deny rather than block on
     # an unresponsive gatekeeper. ISO-8601 durations.

@@ -24,8 +24,8 @@ abstract: >-
   design: only digest, signature, and certificate identifiers traverse
   the supervisory chain — no transaction payload content is exposed
   to the supervisor.
-version: "1.3.0"
-date-released: "2026-07-27"
+version: "1.4.0"
+date-released: "2026-09-02"
 license: MIT
 repository-code: "https://github.com/niklasgillstrom/railgate"
 authors:
