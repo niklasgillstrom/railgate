@@ -2,6 +2,71 @@
 
 This file starts at 1.4.0. Earlier releases are documented in the git history, in `PEER_REVIEW_GUIDE.md` and in `CROSS_REFERENCE.md`.
 
+## 1.5.0
+
+**railgate 1.5.0 requires gatekeeper 1.5.0 or later.** Against gatekeeper 1.4.0 it denies every regulated settlement, exactly as railgate 1.4.0 did.
+
+### Contract defect
+
+- **Every regulated settlement was denied against the real gatekeeper.** railgate calls `POST /api/v1/verify` with four fields: `certSerial`, `issuerDn`, `digestHex`, `signatureBase64`. gatekeeper 1.4.0 required a fifth, `signingCertificatePem`, and answered any request without it with `signatureValid=false, reason=MALFORMED_INPUT` — which is every request railgate sends. `MALFORMED_INPUT` was not in railgate's pass-through set, so the orchestrator fell back to the booleans and reported `SIGNATURE_INVALID`. The result was not a degraded service but a closed one: no regulated settlement could be allowed, and every originating bank was told its signature was bad.
+
+  It survived review because no test ever put the two sides together. `GatekeeperClientTest` drives railgate's client against `MockRestServiceServer` and asserts what railgate *sends*, never what gatekeeper *accepts*; `SettlementOrchestratorTest` mocks `GatekeeperClient` outright; gatekeeper's own tests of `/api/v1/verify` supply the PEM. Both suites were green and the contract between them was never exercised. The documentation did not help: `README.md`'s architecture diagram had gatekeeper "look up cert via (certSerial, issuerDn)", a step gatekeeper 1.4.0 did not have, and the "Known limitation" paragraph described the `MALFORMED_INPUT` → `SIGNATURE_INVALID` mapping as an edge case rather than as the outcome of every call.
+
+  The fix is split across the two repositories and the request stays at four fields. gatekeeper 1.5.0 stores the issued certificate at Step 7 confirmation and resolves it from `(certSerial, issuerDn)`, answering `CERT_NOT_FOUND` when nothing matches. railgate 1.5.0 forwards both identifiers in the agreed form — `certSerial` hexadecimal, case-insensitive, optional `0x`, compared numerically; `issuerDn` an RFC 4514 string, compared by `X500Principal` equality — and checks them, together with gatekeeper's `@NotBlank` and `@Size` limits (128, 512, 256 and 4096 characters), before the call. A request that would fail those checks is answered locally with `INVALID_SIGNATURE_MATERIAL` instead of reaching the gatekeeper and coming back as a 400, which railgate would have reported as `NETWORK_ERROR`.
+
+  `GatekeeperClientTest.requestBodyMatchesTheGatekeeperSignatureVerificationRequest` now pins the field names, the value formats and the absence of `signingCertificatePem` and `algorithm`, cross-checked by hand against gatekeeper's `SignatureVerificationRequest`; further tests pin values at and beyond each size limit. This is still a stub-transport test. It pins railgate's half of the contract as gatekeeper's model states it and would not notice a behavioural change on the gatekeeper side. An end-to-end test that runs both services does not exist yet.
+
+- **`PaymentSignature.certSerial` was documented as a decimal serial.** Under the agreed contract it is hexadecimal. A decimal string is also valid hexadecimal and names a different certificate, so a payment-network client that follows the old javadoc produces `CERT_NOT_FOUND`, not an error. The javadoc and `README.md` now state the format; a `PaymentNetworkClient` implementation must supply the serial in hexadecimal.
+
+### Correctness
+
+- **Gatekeeper input errors are no longer reported as a bad signature.** `MALFORMED_INPUT` and `ALGORITHM_NOT_SUPPORTED` are added to the pass-through set. Both arrive with `signatureValid=false` and both describe a request the gatekeeper could not evaluate, not a signature that failed. With them, the pass-through set covers every non-positive reason gatekeeper's `SignatureVerificationResponse` documents. The 1.4.0 README called the remaining conflation a known limitation; it was the defect above.
+
+- **`declaredCertSerial` was accepted and never read.** `SettlementRequest` took the serial the originating bank declares in pacs.008 `RgltryRptg`, and nothing used it. The documentation implied otherwise in three places: the field's javadoc ("May be null — railgate then queries the payment-network operator"), `SettlementDecision`, which told the bank to populate `RgltryRptg` to cure `DORA_32_AUDIT_MISSING`, and `PaymentNetworkClient`, which said the payment-network operator "cannot misreport the signature or cert serial without immediately producing detectable inconsistency". It is now used: when present, it is compared numerically with the operator's serial, and a difference — or a declared value that is not a hexadecimal serial — is denied as `DECLARED_CERT_MISMATCH` and audited, without a gatekeeper call. Absent or blank means no cross-check, and the operator's serial remains the one verified.
+
+- **The gatekeeper reference in the audit record did not identify the gatekeeper's record of the decision.** `THREAT_MODEL.md` said the audit record "references the gatekeeper audit entry". What railgate stored was gatekeeper's `auditEntryId`, which is the approval-registry `verificationId` the verdict was read from: the same value for every settlement against a certificate, shared with the issuance's own audit entries, and `null` on `CERT_NOT_FOUND`. It survived because railgate's tests stub the gatekeeper with arbitrary identifiers (`ENTRY-X`, `AE-1`) and nothing compared them with what gatekeeper puts in the field. gatekeeper 1.5.0 now also returns `auditEntryHashHex`, the hash of the `SETTLEMENT_VERIFY` entry it wrote for the call, and railgate carries it into `SettlementDecision` and `RailgateAuditLog` next to `auditEntryId`. Against an older gatekeeper the field is absent and stays `null`. Tests: `GatekeeperClientTest.readsTheSettlementAuditEntryHashFromTheGatekeeperResponse`, `SettlementOrchestratorTest.gatekeeperSettlementAuditEntryHashIsCarriedIntoTheDecisionAndTheAuditLog`.
+
+### Security
+
+- **Log injection through values that were logged raw.** `THREAT_MODEL.md` stated that upstream values cannot forge lines in the operator's log. Three could: `GatekeeperClient` logged `certSerial` and the transport exception's message unmodified — and that message carries text from the failed exchange — and `RailgateAuditLog` logged and stored the gatekeeper's `auditEntryId` unmodified on every allowed settlement. All three now go through the existing CR/LF sanitiser (`RailgateAuditLog.sanitise`, now public), and the exception text is capped at 512 characters.
+
+- **The documented TLS configuration had no effect.** `README.md` told deployers to configure the gatekeeper truststore and the mTLS client certificate with `spring.ssl.bundle.jks.*`. `GatekeeperClient` built its own `RestTemplate` on a plain `SimpleClientHttpRequestFactory` and never read a bundle, so a bundle configured as documented was ignored, and against a gatekeeper requiring mTLS every call would have failed as `NETWORK_ERROR`. Only the JVM-wide `javax.net.ssl.*` properties worked. New property `railgate.gatekeeper.ssl-bundle` names a Spring Boot SSL bundle; `GatekeeperClient` resolves it at start-up and sets its `SSLContext` on every gatekeeper connection. An unknown bundle name fails start-up, and so does a bundle that sets ciphers or enabled protocols, which `HttpURLConnection` cannot apply. `RestTemplateBuilder` was not used: in Spring Boot 4 it lives in `spring-boot-restclient`, which is not on this project's classpath. The https requirement, the timeouts and the test constructor are unchanged, and without a bundle the connection is configured exactly as in 1.4.0.
+
+### Documentation
+
+- **Transaction-reference reuse.** `README.md` and `PaymentNetworkClient` presented the residual left by the supplied digest as "an assumption about the payment-network operator". It is wider. railgate looks the artefacts up by transaction reference and never records a reference as consumed, so a settlement that reuses the reference of an earlier, genuinely signed payout verifies and is allowed, whoever submits it, the originating bank included. `README.md`, `PaymentNetworkClient` and `THREAT_MODEL.md` now say so. No replay store is added: to be correct it would have to survive restarts, be shared across instances and tell a replay from a legitimate resubmission after a deny, and an in-memory set does none of that.
+- `CROSS_REFERENCE.md`: the rows for Art 2 §5.1 FR5, §5.3 STR3, §6.3 and §8.5 said the gatekeeper's hash chain and signed export were not implemented, while GAP item 3 of the same file said the audit log is hash-chained. The gatekeeper code has both (`AppendOnlyFileAuditLog`, `GET /v1/audit/export`); the rows now say so and keep forward security, COSE and RFC 3161 as open. The claim that the file is shipped identically across the three repositories was not true and is removed. The railgate row carries the new test counts.
+- `README.md`: the gatekeeper step in the architecture diagram is marked as gatekeeper 1.5.0 or later; new wire-contract table; `DECLARED_CERT_MISMATCH`, `MALFORMED_INPUT` and `ALGORITHM_NOT_SUPPORTED` in the reason-code table; the "Known limitation" paragraph is replaced; transport section and configuration table cover `railgate.gatekeeper.ssl-bundle`; run instructions name `railgate-1.5.0.jar`.
+- `CROSS_REFERENCE.md`: the gatekeeper rows on vendor support (Art 1 §4.3, Art 2 §5.2 NFR5), the Step-7 nonce and the approval-registry journal — which is persistent but not tamper-evident — are brought into line with gatekeeper 1.5.0.
+- `THREAT_MODEL.md`, `PEER_REVIEW_GUIDE.md`, and the javadoc of `PaymentSignature`, `SettlementRequest`, `SettlementDecision`, `PaymentNetworkClient` and `SettlementOrchestrator` are brought into line with the above.
+
+### API changes
+
+- New reason code `DECLARED_CERT_MISMATCH`. `MALFORMED_INPUT` and `ALGORITHM_NOT_SUPPORTED` now reach the originating bank instead of `SIGNATURE_INVALID`.
+- `INVALID_SIGNATURE_MATERIAL` is also returned for a certificate serial that is not hexadecimal or exceeds 128 characters, an issuer DN that is not an RFC 4514 name or exceeds 512 characters, and a signature over 4096 characters.
+- `GatekeeperClient`: the `@Autowired` constructor additionally takes the SSL bundle name and an `ObjectProvider<SslBundles>`. The four-argument public constructor is retained and uses no bundle.
+- New `PaymentSignature.MAX_CERT_SERIAL_LENGTH` and `PaymentSignature.parseCertSerial(String)`. `RailgateAuditLog.sanitise(String, int)` is public.
+- `VerificationResult.auditEntryHashHex` and `SettlementDecision.auditEntryHashHex` added; `RailgateAuditLog.AuditEntry` gains a trailing `gatekeeperAuditEntryHashHex` component, so code constructing the record directly must pass it. The `Settlement ALLOWED` log line adds `gatekeeperEntryHash=`.
+
+### Configuration
+
+- New key `railgate.gatekeeper.ssl-bundle` (default empty).
+
+### Tests
+
+`mvn -B test` runs 62 tests, up from 39: including 2 from the documentation-versus-code review (the `auditEntryHashHex` entry under Correctness) and 4 in `FilePaymentNetworkClientTest` (Local end-to-end support). New: `RailgateAuditLogTest` (1); five cases in `SettlementOrchestratorTest` (gatekeeper `MALFORMED_INPUT` and `ALGORITHM_NOT_SUPPORTED`, declared-serial mismatch, non-hexadecimal declared serial, numerically equal declared serial); eleven in `GatekeeperClientTest` (the contract test, size limits at and beyond the boundary, non-hexadecimal serial, non-RFC 4514 issuer DN, log injection through a transport error, five for the SSL bundle). `forwardsExactlyTheFourDataMinimisedFields` is unchanged.
+
+### Dependencies
+
+- `tomcat.version` 11.0.25 → 11.0.26, which fixes CVE-2026-73581, -75973, -76183, -77756, -77762, -77791, -78383, -78437, -79677, -86248, -86350 and -87022. Boot 4.1.1 still manages 11.0.24.
+- `springdoc-openapi-starter-webmvc-ui` 3.1.0 → 3.1.1. springdoc 3.1.1 ships swagger-ui 5.32.14; `org.webjars:swagger-ui` stays pinned, now at 5.32.15.
+- `dependency-check-maven` stays at 12.2.2. 13.0.0 is the latest release, but it cannot update its NVD data without an API key (dependency-check/DependencyCheck#8715); the fix is merged for 13.0.1, which has not been released. gatekeeper and hsm stay on 12.2.2 for the same reason, so all three repositories build with `mvn verify` without a key.
+- Unchanged: Spring Boot parent 4.1.1, Lombok 1.18.48, `maven-enforcer-plugin` 3.6.3. `maven-compiler-plugin` is not pinned in this POM and stays at the version the parent manages.
+
+### Local end-to-end support
+
+- **`railgate.payment-network.mode=file`.** `InMemoryPaymentNetworkClient` can only be filled from Java code, so a railgate started from its jar answered every regulated settlement with `DORA_32_AUDIT_MISSING` and never called gatekeeper; the settlement leg could not be exercised across real processes. `FilePaymentNetworkClient` reads signature artefacts from a tab-separated file named by `railgate.payment-network.file` (reference, certificate serial, issuer DN, digest, signature), re-read on every lookup. A missing file or malformed line yields no artefacts, so the orchestrator still denies. Not for production. Tests: `FilePaymentNetworkClientTest` (4). Used by the local end-to-end harness in the gatekeeper repository (`gatekeeper/e2e`).
+
 ## 1.4.0
 
 Every item below is a defect that was present in 1.3.0. Where a defect had a reason for surviving review, that reason is stated rather than left out.

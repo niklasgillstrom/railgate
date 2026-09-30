@@ -11,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.math.BigInteger;
 import java.util.Optional;
 import java.util.Set;
 
@@ -25,6 +26,10 @@ import java.util.Set;
  *   <li>Retrieve {@code (digest, signature, certSerial)} from the
  *       payment-network operator. Missing entry → default-deny with
  *       {@code DORA_32_AUDIT_MISSING}.</li>
+ *   <li>If the settlement message declares a certificate serial, compare it
+ *       numerically with the payment-network operator's. A difference →
+ *       default-deny with {@code DECLARED_CERT_MISMATCH}, without calling
+ *       the gatekeeper.</li>
  *   <li>Forward to gatekeeper for cryptographic verification and
  *       compliance check.</li>
  *   <li>Allow if and only if both signature is valid and certificate is
@@ -84,6 +89,17 @@ public class SettlementOrchestrator {
                     .build());
         }
 
+        if (declaredCertSerialMismatch(request.getDeclaredCertSerial(), signature.get().getCertSerial())) {
+            return record(SettlementDecision.builder()
+                    .allow(false)
+                    .reasonCode("DECLARED_CERT_MISMATCH")
+                    .message("The certificate serial declared in the settlement message does "
+                            + "not match the serial the payment-network operator holds for "
+                            + "this transaction reference.")
+                    .transactionReference(request.getTransactionReference())
+                    .build());
+        }
+
         VerificationResult verification = gatekeeperClient.verify(signature.get());
 
         if (!verification.isAllowed()) {
@@ -95,6 +111,7 @@ public class SettlementOrchestrator {
                             : "Verification did not return a positive result")
                     .transactionReference(request.getTransactionReference())
                     .auditEntryId(verification.getAuditEntryId())
+                    .auditEntryHashHex(verification.getAuditEntryHashHex())
                     .build());
         }
 
@@ -104,6 +121,7 @@ public class SettlementOrchestrator {
                 .message("Cryptographic verification passed against compliant gatekeeper audit entry")
                 .transactionReference(request.getTransactionReference())
                 .auditEntryId(verification.getAuditEntryId())
+                .auditEntryHashHex(verification.getAuditEntryHashHex())
                 .build());
     }
 
@@ -112,22 +130,43 @@ public class SettlementOrchestrator {
         return decision;
     }
 
+    private static boolean declaredCertSerialMismatch(String declaredCertSerial, String operatorCertSerial) {
+        if (declaredCertSerial == null || declaredCertSerial.isBlank()) {
+            return false;
+        }
+        BigInteger operator = PaymentSignature.parseCertSerial(operatorCertSerial);
+        if (operator == null) {
+            return false;
+        }
+        return !operator.equals(PaymentSignature.parseCertSerial(declaredCertSerial.trim()));
+    }
+
     /**
      * Reason codes that may arrive in {@link VerificationResult#getReason()}
      * and are passed through unchanged.
      *
-     * <p>The first four are produced by the gatekeeper. The fifth is produced
-     * by {@code GatekeeperClient} itself: {@code NETWORK_ERROR} when the
-     * supervisor could not be reached, {@code INVALID_SIGNATURE_MATERIAL}
-     * when the artefacts from the payment-network operator were malformed and
-     * the call was never made. Both describe a failure upstream of the
-     * cryptography and must not be reported as {@code SIGNATURE_INVALID},
-     * which is an accusation against the originating bank.</p>
+     * <p>The first five are produced by the gatekeeper. {@code MALFORMED_INPUT}
+     * (the gatekeeper could not parse the request; gatekeeper 1.4.0 answered
+     * it to every request railgate sends, because it required a PEM
+     * certificate railgate does not forward) and
+     * {@code ALGORITHM_NOT_SUPPORTED} (the gatekeeper would not run the
+     * signature algorithm) say nothing about the
+     * signature; both arrive with {@code signatureValid=false}, and deriving
+     * the code from that boolean reported them as {@code SIGNATURE_INVALID}.
+     * The last two are produced by {@code GatekeeperClient} itself:
+     * {@code NETWORK_ERROR} when the supervisor could not be reached,
+     * {@code INVALID_SIGNATURE_MATERIAL} when the artefacts from the
+     * payment-network operator were malformed and the call was never made.
+     * All four describe a failure outside the cryptography and must not be
+     * reported as {@code SIGNATURE_INVALID}, which is an accusation against
+     * the originating bank.</p>
      */
     private static final Set<String> PASSTHROUGH_REASONS = Set.of(
             "CERT_NOT_FOUND",
             "CERT_NON_COMPLIANT",
             "SIGNATURE_INVALID",
+            "MALFORMED_INPUT",
+            "ALGORITHM_NOT_SUPPORTED",
             "NETWORK_ERROR",
             "INVALID_SIGNATURE_MATERIAL");
 

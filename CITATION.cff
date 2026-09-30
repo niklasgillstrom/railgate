@@ -19,11 +19,16 @@ abstract: >-
   passing it through, requires https for the gatekeeper connection, turns
   unhandled failures into a 403 deny that carries nothing from the
   exception, and reports the gatekeeper's own reason code to the
-  originating bank. Data-minimised by design: only digest, signature, and
+  originating bank. Version 1.5.0 fixes a contract defect under which
+  every regulated settlement was denied against the real gatekeeper
+  (gatekeeper 1.4.0 required a certificate railgate never sends), aligns
+  railgate with the four-field verification contract of gatekeeper 1.5.0,
+  and stops reporting gatekeeper input errors to the originating bank as a
+  bad signature. Data-minimised by design: only digest, signature, and
   certificate identifiers traverse the supervisory chain — no transaction
   payload content is exposed to the supervisor.
-version: "1.4.0"
-date-released: "2026-09-02"
+version: "1.5.0"
+date-released: "2026-09-30"
 license: MIT
 repository-code: "https://github.com/niklasgillstrom/railgate"
 authors:

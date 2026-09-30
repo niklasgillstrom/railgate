@@ -16,7 +16,7 @@ The three components together operationalise the data-minimised quadruple-triang
 
 - A **reference implementation** of settlement-rail enforcement as described in Article 1 §4.3 and §6.2 and in Article 2 §6.1 and §9.3. Railgate sits at the central-bank settlement rail and performs deterministic cryptographic signature verification at settlement time, blocking any settlement that cannot be matched to a compliant gatekeeper audit entry.
 - A **demonstration** of the data-minimisation contract: the supervisor never sees transaction payload content, only the SHA-512 digest, the signature, and the certificate identifiers. SHA-512 collision resistance binds the signature to the payload the digest was taken over — not, by itself, to the pacs.008 message being settled; see the note on the residual binding assumption in `README.md`.
-- A **default-deny enforcement** prototype with structured reason codes returned to the originating bank. The complete set is `ALLOWED`, `NOT_REGULATED`, `DORA_32_AUDIT_MISSING`, `CERT_NOT_FOUND`, `SIGNATURE_INVALID`, `CERT_NON_COMPLIANT`, `NETWORK_ERROR`, `INVALID_SIGNATURE_MATERIAL`, `INVALID_REQUEST`, `INTERNAL_ERROR`; `README.md` tabulates each with its HTTP status. No other value is reachable.
+- A **default-deny enforcement** prototype with structured reason codes returned to the originating bank. The complete set is `ALLOWED`, `NOT_REGULATED`, `DORA_32_AUDIT_MISSING`, `DECLARED_CERT_MISMATCH`, `CERT_NOT_FOUND`, `SIGNATURE_INVALID`, `CERT_NON_COMPLIANT`, `MALFORMED_INPUT`, `ALGORITHM_NOT_SUPPORTED`, `NETWORK_ERROR`, `INVALID_SIGNATURE_MATERIAL`, `INVALID_REQUEST`, `INTERNAL_ERROR`; `README.md` tabulates each with its HTTP status. No other value is reachable.
 
 **Isn't:**
 
@@ -70,7 +70,7 @@ Reviewers approaching v1.2.0 should focus on the following:
 
 ## Requirements
 
-- **Java 21** (Spring Boot 4.x baseline)
+- **Java 21 or later**: the build targets Java 21 (`java.version` in `pom.xml`). Spring Boot 4.1.1 itself requires Java 17 and is compatible up to and including Java 26.
 - **Maven 3.6.3** or later (enforced by `maven-enforcer-plugin`)
 - Access to a running gatekeeper instance for end-to-end testing (defaults to `https://localhost:8443`, and a non-`https` URL is refused at start-up unless `railgate.gatekeeper.allow-insecure-http=true`). No live gatekeeper is required for `mvn -B test`: the orchestrator tests mock `GatekeeperClient`, the client tests drive the real client against `MockRestServiceServer`, and `ApplicationContextLoadsTest` constructs the client without calling it.
 
@@ -85,13 +85,13 @@ mvn -B clean verify
 Expected output:
 
 ```
-[INFO] Tests run: 39, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 62, Failures: 0, Errors: 0, Skipped: 0
 [INFO] BUILD SUCCESS
 ```
 
-The 39 tests are distributed as follows.
+The 62 tests are distributed as follows.
 
-`SettlementOrchestratorTest` (13):
+`SettlementOrchestratorTest` (19):
 
 1. `allowsSettlementWhenSignatureVerifiesAndCertCompliant` — happy path; gatekeeper returns `signatureValid=true, compliant=true`.
 2. `deniesWhenSignatureMissingFromPaymentNetwork` — payment-network operator has no record → `DORA_32_AUDIT_MISSING`.
@@ -106,8 +106,18 @@ The 39 tests are distributed as follows.
 11. `gatekeeperOutageIsReportedAsNetworkErrorThroughTheOrchestrator` — regression test for the 1.3.0 fix, at the layer that decides the code the bank receives.
 12. `malformedSignatureMaterialIsNotReportedAsSignatureInvalid` — `INVALID_SIGNATURE_MATERIAL` passes through.
 13. `unknownGatekeeperReasonFallsBackToTheBooleanDerivation` — an unrecognised reason does not become the reason code.
+14. `malformedInputFromGatekeeperIsNotReportedAsSignatureInvalid` — gatekeeper's `MALFORMED_INPUT` passes through.
+15. `algorithmNotSupportedFromGatekeeperIsNotReportedAsSignatureInvalid` — gatekeeper's `ALGORITHM_NOT_SUPPORTED` passes through.
+16. `declaredCertSerialThatDiffersFromTheOperatorSerialIsDeniedAndAudited` — `DECLARED_CERT_MISMATCH`, no gatekeeper call, one audit entry.
+17. `declaredCertSerialThatIsNotHexadecimalIsDenied` — an unparseable declared serial is a mismatch.
+18. `declaredCertSerialNumericallyEqualToTheOperatorSerialIsNotAMismatch` — `" 0X0012345 "` equals `12345`; settlement proceeds.
+19. `gatekeeperSettlementAuditEntryHashIsCarriedIntoTheDecisionAndTheAuditLog` — the gatekeeper's `auditEntryHashHex` reaches the decision and `RailgateAuditLog` on an allow and on a `CERT_NOT_FOUND` deny, where the registry `auditEntryId` is `null`.
 
-`GatekeeperClientTest` (12): the five transport tests from 1.3.0 (data-minimisation contract, server error, empty body, unparseable body, foreign JSON), three start-up tests for the `https://` requirement and its override, and four for the cryptographic-material checks (short digest, non-hex digest, non-base64 signature, blank certificate serial or issuer DN) — each asserting that no call to the gatekeeper is made.
+`GatekeeperClientTest` (24): the five transport tests from 1.3.0 (data-minimisation contract, server error, empty body, unparseable body, foreign JSON), three start-up tests for the `https://` requirement and its override, and four for the cryptographic-material checks (short digest, non-hex digest, non-base64 signature, blank certificate serial or issuer DN) — each asserting that no call to the gatekeeper is made. Added in 1.5.0: the contract test against gatekeeper's `SignatureVerificationRequest` (`requestBodyMatchesTheGatekeeperSignatureVerificationRequest`), values at and beyond the gatekeeper's `@Size` limits, a non-hexadecimal certificate serial, an issuer DN that is not an RFC 4514 name, a transport error whose message carries CR/LF, and five tests for the SSL bundle (none configured, blank name, bundle applied to the connection, unknown bundle, bundle with cipher or protocol options). Added after the 1.5.0 review: `readsTheSettlementAuditEntryHashFromTheGatekeeperResponse`, the gatekeeper's `auditEntryHashHex` deserialised next to `auditEntryId`.
+
+`FilePaymentNetworkClientTest` (4): artefacts are found by transaction reference, entries written after start-up are visible, unknown references and malformed lines yield nothing, and file mode without a file is refused at start-up.
+
+`RailgateAuditLogTest` (1): a gatekeeper audit-entry identifier carrying CR/LF is flattened before it is stored or logged.
 
 `SettlementRequestValidationTest` (4): a payload carrying only `transactionReference` is rejected on both party-type flags; a fully classified request validates; a blank reference and an over-35-character instrument code are rejected.
 
@@ -117,7 +127,7 @@ The 39 tests are distributed as follows.
 
 `OpenApiExposureDefaultProfileTest` (2) and `OpenApiExposureDevProfileTest` (2): `/v3/api-docs` and `/swagger-ui.html` are 404 under the shipped configuration and served only with the `dev` profile.
 
-OWASP Dependency-Check runs as part of `verify` and passes without suppressions (`.owasp-suppressions.xml` is empty). The earlier DOMPurify finding inside swagger-ui was resolved by pinning `org.webjars:swagger-ui` to 5.32.14; Tomcat is overridden to 11.0.25 for the same reason (see `CHANGELOG.md`, Dependencies). Swagger UI itself is served only under the `dev` profile.
+OWASP Dependency-Check runs as part of `verify` and passes without suppressions (`.owasp-suppressions.xml` is empty). The plugin stays at 12.2.2: 13.0.0 cannot update its NVD data without an NVD API key (dependency-check/DependencyCheck#8715, fixed for the unreleased 13.0.1). The earlier DOMPurify finding inside swagger-ui was resolved by pinning `org.webjars:swagger-ui` (5.32.15 since 1.5.0); Tomcat is overridden to 11.0.26 for the same reason (see `CHANGELOG.md`, Dependencies). Swagger UI itself is served only under the `dev` profile.
 
 ---
 
@@ -141,6 +151,7 @@ The following assertions are reproducible by running `mvn -B test`:
 | `railgate.gatekeeper.allow-insecure-http` | `false` | Permits a non-`https` base URL for a local development run. Logs a WARN at every start-up when set. |
 | `railgate.gatekeeper.connect-timeout` | `PT2S` | TCP connect timeout for gatekeeper calls. |
 | `railgate.gatekeeper.read-timeout` | `PT5S` | Response read timeout for gatekeeper calls. Exceeding either timeout yields `NETWORK_ERROR` and a deny. |
+| `railgate.gatekeeper.ssl-bundle` | *(empty)* | Spring Boot SSL bundle (`spring.ssl.bundle.*`) used for the gatekeeper connection's trust and key material. Empty means the JVM default SSL context; an unknown name fails start-up. |
 | `railgate.regulated.local-instrument-codes` | `SWISH` | Comma-separated list of `LclInstrm/Cd` values that identify regulated payments. Matched case-insensitively and whitespace-trimmed. |
 
 ---
@@ -184,7 +195,7 @@ For a production deployment, the following extension points must be addressed:
 
 1. **`PaymentNetworkClient` HTTP implementation** — replace `InMemoryPaymentNetworkClient` with an HTTP client that calls Getswish AB's (or equivalent's) signature-retrieval endpoint. Set `railgate.payment-network.mode` to a non-default value and provide a Spring bean that implements `PaymentNetworkClient`.
 2. **pacs.008 ingress** — wire the `SettlementController.precheck` endpoint into the central-bank settlement pipeline. The pipeline must extract the seven fields modelled by `SettlementRequest` from the incoming pacs.008 and synchronously block the settlement based on the orchestrator's response. Both party-type flags are required; omitting them is a 400, not a pass-through.
-3. **mTLS configuration** — production deployments require mTLS in both directions. *Outbound:* railgate → gatekeeper, where the `SETTLEMENT_RAIL` role authorises the call to `/api/v1/verify`; configure the truststore and client key via Spring Boot's SSL properties. *Inbound:* settlement rail → railgate, where `SecurityConfig`'s `/api/v1/**` chain ships HTTP Basic and the deployer substitutes `.x509(...)` together with `server.ssl.client-auth=need`. Note that railgate does not verify a signature over the gatekeeper's verdict, so the outbound TLS configuration is load-bearing rather than defence in depth.
+3. **mTLS configuration** — production deployments require mTLS in both directions. *Outbound:* railgate → gatekeeper, where the `SETTLEMENT_RAIL` role authorises the call to `/api/v1/verify`; define the truststore and client key as a Spring Boot SSL bundle and name it in `railgate.gatekeeper.ssl-bundle`. *Inbound:* settlement rail → railgate, where `SecurityConfig`'s `/api/v1/**` chain ships HTTP Basic and the deployer substitutes `.x509(...)` together with `server.ssl.client-auth=need`. Note that railgate does not verify a signature over the gatekeeper's verdict, so the outbound TLS configuration is load-bearing rather than defence in depth.
 4. **Persistent audit log** — the `RailgateAuditLog` reference uses an in-memory list. Production deployments must back this with a tamper-evident persistent log (a hash-chained append-only file in the manner of `AppendOnlyFileAuditLog` in the gatekeeper repo would be a suitable starting point).
 
 ---

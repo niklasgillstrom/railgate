@@ -16,17 +16,29 @@ import lombok.NoArgsConstructor;
  * <p>{@code reasonCode} is one of:
  * <ul>
  *   <li>{@code ALLOWED} — verification passed, settle.</li>
- *   <li>{@code DORA_32_AUDIT_MISSING} — no cert serial available; bank
- *       must populate pacs.008 RgltryRptg or the payment-network operator
- *       must expose the signature for this transaction.</li>
+ *   <li>{@code NOT_REGULATED} — not subject to railgate enforcement;
+ *       passed through without verification.</li>
+ *   <li>{@code DORA_32_AUDIT_MISSING} — the payment-network operator holds
+ *       no signature artefacts for this transaction reference. A serial
+ *       declared in pacs.008 RgltryRptg does not substitute for them.</li>
+ *   <li>{@code DECLARED_CERT_MISMATCH} — the serial declared in pacs.008
+ *       RgltryRptg differs from the payment-network operator's; the
+ *       gatekeeper is not called.</li>
  *   <li>{@code CERT_NOT_FOUND} — cert serial does not match any
  *       gatekeeper audit entry; either circumvented issuance or wrong
  *       cert.</li>
  *   <li>{@code SIGNATURE_INVALID} — cryptographic verification failed.</li>
  *   <li>{@code CERT_NON_COMPLIANT} — cert exists but did not pass
  *       structural-independence checks at issuance.</li>
- *   <li>{@code NETWORK_ERROR} — gatekeeper or payment-network operator
- *       unreachable; default-deny applies.</li>
+ *   <li>{@code MALFORMED_INPUT} / {@code ALGORITHM_NOT_SUPPORTED} — the
+ *       gatekeeper could not evaluate the request; not a signature
+ *       failure.</li>
+ *   <li>{@code INVALID_SIGNATURE_MATERIAL} — the payment-network operator's
+ *       artefacts are malformed; the gatekeeper is not called.</li>
+ *   <li>{@code NETWORK_ERROR} — gatekeeper unreachable, timed out or
+ *       returned an unusable body; default-deny applies.</li>
+ *   <li>{@code INVALID_REQUEST} / {@code INTERNAL_ERROR} — produced by
+ *       {@code SettlementExceptionHandler}.</li>
  * </ul>
  */
 @Data
@@ -44,4 +56,6 @@ public class SettlementDecision {
     private String transactionReference;
 
     private String auditEntryId;
+
+    private String auditEntryHashHex;
 }

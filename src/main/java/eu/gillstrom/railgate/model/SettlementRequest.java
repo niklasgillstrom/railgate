@@ -70,10 +70,14 @@ public class SettlementRequest {
     private String localInstrumentCode;
 
     /**
-     * Optional certificate serial number, extracted from
-     * pacs.008 RgltryRptg field if populated by the originating bank. May
-     * be null — railgate then queries the payment-network operator for
-     * the authoritative cert serial.
+     * Optional certificate serial number, extracted from the pacs.008
+     * RgltryRptg field if populated by the originating bank, in the same
+     * hexadecimal format as {@code PaymentSignature.certSerial}. The
+     * payment-network operator's serial is always the one verified; this
+     * value is a cross-check against it. When present, railgate compares the
+     * two numerically and denies with {@code DECLARED_CERT_MISMATCH} if they
+     * differ, or if this value is not a hexadecimal serial. Null or blank
+     * means no cross-check.
      */
     private String declaredCertSerial;
 

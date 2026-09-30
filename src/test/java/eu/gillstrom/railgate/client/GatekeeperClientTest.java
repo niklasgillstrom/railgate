@@ -1,20 +1,39 @@
 package eu.gillstrom.railgate.client;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import eu.gillstrom.railgate.model.PaymentSignature;
 import eu.gillstrom.railgate.model.VerificationResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.ssl.NoSuchSslBundleException;
+import org.springframework.boot.ssl.SslBundle;
+import org.springframework.boot.ssl.SslBundles;
+import org.springframework.boot.ssl.SslOptions;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.ClientHttpRequest;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestTemplate;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import java.io.IOException;
+import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.hamcrest.Matchers.matchesPattern;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.jsonPath;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
@@ -77,6 +96,22 @@ class GatekeeperClientTest {
         assertThat(result.isSignatureValid()).isTrue();
         assertThat(result.isCompliant()).isTrue();
         assertThat(result.getAuditEntryId()).isEqualTo("AE-1");
+    }
+
+    @Test
+    void readsTheSettlementAuditEntryHashFromTheGatekeeperResponse() {
+        String hash = "ab".repeat(32);
+        server.expect(requestTo(VERIFY_URL))
+                .andRespond(withSuccess(
+                        "{\"signatureValid\":true,\"compliant\":true,\"auditEntryId\":\"AE-3\","
+                                + "\"reason\":\"OK\",\"auditEntryHashHex\":\"" + hash + "\"}",
+                        MediaType.APPLICATION_JSON));
+
+        VerificationResult result = client.verify(signature());
+
+        server.verify();
+        assertThat(result.getAuditEntryId()).isEqualTo("AE-3");
+        assertThat(result.getAuditEntryHashHex()).isEqualTo(hash);
     }
 
     @Test
@@ -230,5 +265,241 @@ class GatekeeperClientTest {
         server.verify();
         assertThat(blankSerial.getReason()).isEqualTo("INVALID_SIGNATURE_MATERIAL");
         assertThat(blankIssuer.getReason()).isEqualTo("INVALID_SIGNATURE_MATERIAL");
+    }
+
+
+    @Test
+    void requestBodyMatchesTheGatekeeperSignatureVerificationRequest() {
+        String certSerial = "0x00C0FFEE";
+        String issuerDn = "CN=SEB Customer CA3 v1 for BankID,O=Skandinaviska Enskilda Banken AB (publ),C=SE";
+
+        server.expect(requestTo(VERIFY_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andExpect(jsonPath("$.length()").value(4))
+                .andExpect(jsonPath("$.certSerial", matchesPattern("(0[xX])?[0-9a-fA-F]{1,126}")))
+                .andExpect(jsonPath("$.certSerial").value(certSerial))
+                .andExpect(jsonPath("$.issuerDn").value(issuerDn))
+                .andExpect(jsonPath("$.digestHex", matchesPattern("[0-9a-fA-F]{128}")))
+                .andExpect(jsonPath("$.signatureBase64", matchesPattern("[A-Za-z0-9+/]+={0,2}")))
+                .andExpect(jsonPath("$.signingCertificatePem").doesNotExist())
+                .andExpect(jsonPath("$.algorithm").doesNotExist())
+                .andRespond(withSuccess(
+                        "{\"signatureValid\":true,\"compliant\":true,\"auditEntryId\":\"AE-2\",\"reason\":\"OK\"}",
+                        MediaType.APPLICATION_JSON));
+
+        VerificationResult result = client.verify(PaymentSignature.builder()
+                .digestHex(DIGEST_HEX)
+                .signatureBase64("c2lnbmF0dXJl")
+                .certSerial(certSerial)
+                .issuerDn(issuerDn)
+                .build());
+
+        server.verify();
+        assertThat(result.isAllowed()).isTrue();
+    }
+
+    @Test
+    void valuesAtTheGatekeeperSizeLimitsAreForwarded() {
+        String certSerial = "0x" + "f".repeat(126);
+        String issuerDn = "CN=" + "a".repeat(509);
+        String signatureBase64 = "AAAA".repeat(1024);
+
+        server.expect(requestTo(VERIFY_URL))
+                .andExpect(jsonPath("$.certSerial").value(certSerial))
+                .andExpect(jsonPath("$.issuerDn").value(issuerDn))
+                .andExpect(jsonPath("$.signatureBase64").value(signatureBase64))
+                .andRespond(withSuccess(
+                        "{\"signatureValid\":false,\"compliant\":false,\"reason\":\"CERT_NOT_FOUND\"}",
+                        MediaType.APPLICATION_JSON));
+
+        VerificationResult result = client.verify(PaymentSignature.builder()
+                .digestHex(DIGEST_HEX)
+                .signatureBase64(signatureBase64)
+                .certSerial(certSerial)
+                .issuerDn(issuerDn)
+                .build());
+
+        server.verify();
+        assertThat(certSerial).hasSize(128);
+        assertThat(issuerDn).hasSize(512);
+        assertThat(signatureBase64).hasSize(4096);
+        assertThat(result.getReason()).isEqualTo("CERT_NOT_FOUND");
+    }
+
+    @Test
+    void valuesBeyondTheGatekeeperSizeLimitsAreRejectedWithoutCallingGatekeeper() {
+        VerificationResult longSerial = client.verify(PaymentSignature.builder()
+                .digestHex(DIGEST_HEX)
+                .signatureBase64("c2lnbmF0dXJl")
+                .certSerial("f".repeat(129))
+                .issuerDn("CN=SEB Customer CA")
+                .build());
+
+        VerificationResult longIssuer = client.verify(PaymentSignature.builder()
+                .digestHex(DIGEST_HEX)
+                .signatureBase64("c2lnbmF0dXJl")
+                .certSerial("0123456789")
+                .issuerDn("CN=" + "a".repeat(510))
+                .build());
+
+        VerificationResult longSignature = client.verify(PaymentSignature.builder()
+                .digestHex(DIGEST_HEX)
+                .signatureBase64("AAAA".repeat(1025))
+                .certSerial("0123456789")
+                .issuerDn("CN=SEB Customer CA")
+                .build());
+
+        server.verify();
+        assertThat(longSerial.getReason()).isEqualTo("INVALID_SIGNATURE_MATERIAL");
+        assertThat(longIssuer.getReason()).isEqualTo("INVALID_SIGNATURE_MATERIAL");
+        assertThat(longSignature.getReason()).isEqualTo("INVALID_SIGNATURE_MATERIAL");
+    }
+
+    @Test
+    void certSerialThatIsNotHexadecimalIsRejectedWithoutCallingGatekeeper() {
+        for (String certSerial : List.of("12:34:56", "0x", "-1f", "serial 1", "0123456789\n")) {
+            VerificationResult result = client.verify(PaymentSignature.builder()
+                    .digestHex(DIGEST_HEX)
+                    .signatureBase64("c2lnbmF0dXJl")
+                    .certSerial(certSerial)
+                    .issuerDn("CN=SEB Customer CA")
+                    .build());
+
+            assertThat(result.getReason()).as(certSerial).isEqualTo("INVALID_SIGNATURE_MATERIAL");
+        }
+        server.verify();
+    }
+
+    @Test
+    void issuerDnThatIsNotADistinguishedNameIsRejectedWithoutCallingGatekeeper() {
+        VerificationResult result = client.verify(PaymentSignature.builder()
+                .digestHex(DIGEST_HEX)
+                .signatureBase64("c2lnbmF0dXJl")
+                .certSerial("0123456789")
+                .issuerDn("SEB Customer CA")
+                .build());
+
+        server.verify();
+        assertThat(result.getReason()).isEqualTo("INVALID_SIGNATURE_MATERIAL");
+    }
+
+
+    @Test
+    void transportErrorDetailCannotForgeLogLines() {
+        Logger logger = (Logger) LoggerFactory.getLogger(GatekeeperClient.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            server.expect(requestTo(VERIFY_URL)).andRespond(request -> {
+                throw new IOException("connection reset\r\nWARN forged entry");
+            });
+
+            VerificationResult result = client.verify(signature());
+
+            assertThat(result.getReason()).isEqualTo("NETWORK_ERROR");
+            assertThat(appender.list).isNotEmpty();
+            assertThat(appender.list).allSatisfy(event ->
+                    assertThat(event.getFormattedMessage()).doesNotContain("\r", "\n"));
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
+
+    @Test
+    void withoutAnSslBundleTheGatekeeperConnectionUsesTheJvmDefault() throws Exception {
+        GatekeeperClient plain = new GatekeeperClient(
+                "https://gatekeeper.test:8443",
+                Duration.ofSeconds(2),
+                Duration.ofSeconds(5),
+                false);
+
+        assertThat(connectionOf(plain).getSSLSocketFactory())
+                .isSameAs(HttpsURLConnection.getDefaultSSLSocketFactory());
+    }
+
+    @Test
+    void aBlankSslBundleNameDoesNotConsultTheRegistry() throws Exception {
+        SslBundles bundles = mock(SslBundles.class);
+
+        GatekeeperClient plain = new GatekeeperClient(
+                "https://gatekeeper.test:8443",
+                Duration.ofSeconds(2),
+                Duration.ofSeconds(5),
+                false,
+                "",
+                bundles);
+
+        verifyNoInteractions(bundles);
+        assertThat(connectionOf(plain).getSSLSocketFactory())
+                .isSameAs(HttpsURLConnection.getDefaultSSLSocketFactory());
+    }
+
+    @Test
+    void theConfiguredSslBundleIsAppliedToTheGatekeeperConnection() throws Exception {
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(null, null, null);
+        SslBundle bundle = mock(SslBundle.class);
+        when(bundle.getOptions()).thenReturn(SslOptions.NONE);
+        when(bundle.createSslContext()).thenReturn(sslContext);
+        SslBundles bundles = mock(SslBundles.class);
+        when(bundles.getBundle("gatekeeper")).thenReturn(bundle);
+
+        GatekeeperClient withBundle = new GatekeeperClient(
+                "https://gatekeeper.test:8443",
+                Duration.ofSeconds(2),
+                Duration.ofSeconds(5),
+                false,
+                "gatekeeper",
+                bundles);
+
+        verify(bundles).getBundle("gatekeeper");
+        verify(bundle).createSslContext();
+        assertThat(connectionOf(withBundle).getSSLSocketFactory())
+                .isNotNull()
+                .isNotSameAs(HttpsURLConnection.getDefaultSSLSocketFactory());
+    }
+
+    @Test
+    void anUnknownSslBundleFailsAtStartUp() {
+        SslBundles bundles = mock(SslBundles.class);
+        when(bundles.getBundle("missing"))
+                .thenThrow(new NoSuchSslBundleException("missing", "SSL bundle name 'missing' cannot be found"));
+
+        assertThatThrownBy(() -> new GatekeeperClient(
+                        "https://gatekeeper.test:8443",
+                        Duration.ofSeconds(2),
+                        Duration.ofSeconds(5),
+                        false,
+                        "missing",
+                        bundles))
+                .isInstanceOf(NoSuchSslBundleException.class);
+    }
+
+    @Test
+    void anSslBundleWithOptionsTheConnectionCannotApplyFailsAtStartUp() {
+        SslBundle bundle = mock(SslBundle.class);
+        when(bundle.getOptions()).thenReturn(
+                SslOptions.of(new String[] {"TLS_AES_256_GCM_SHA384"}, new String[] {"TLSv1.3"}));
+        SslBundles bundles = mock(SslBundles.class);
+        when(bundles.getBundle("gatekeeper")).thenReturn(bundle);
+
+        assertThatThrownBy(() -> new GatekeeperClient(
+                        "https://gatekeeper.test:8443",
+                        Duration.ofSeconds(2),
+                        Duration.ofSeconds(5),
+                        false,
+                        "gatekeeper",
+                        bundles))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("gatekeeper");
+    }
+
+    private static HttpsURLConnection connectionOf(GatekeeperClient client) throws IOException {
+        RestTemplate template = (RestTemplate) ReflectionTestUtils.getField(client, "restTemplate");
+        ClientHttpRequest request = template.getRequestFactory()
+                .createRequest(URI.create("https://gatekeeper.test:8443/api/v1/verify"), HttpMethod.POST);
+        return (HttpsURLConnection) ReflectionTestUtils.getField(request, "connection");
     }
 }

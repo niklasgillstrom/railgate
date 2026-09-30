@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class SettlementOrchestratorTest {
@@ -296,6 +297,139 @@ class SettlementOrchestratorTest {
 
         assertThat(orchestrator.evaluate(request).getReasonCode())
                 .isEqualTo("CERT_NON_COMPLIANT");
+    }
+
+    @Test
+    void malformedInputFromGatekeeperIsNotReportedAsSignatureInvalid() {
+        SettlementRequest request = regulatedRequest("TXREF-10");
+        registerSignature("TXREF-10");
+
+        when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                .signatureValid(false)
+                .compliant(false)
+                .reason("MALFORMED_INPUT")
+                .build());
+
+        SettlementDecision decision = orchestrator.evaluate(request);
+
+        assertThat(decision.isAllow()).isFalse();
+        assertThat(decision.getReasonCode()).isEqualTo("MALFORMED_INPUT");
+    }
+
+    @Test
+    void algorithmNotSupportedFromGatekeeperIsNotReportedAsSignatureInvalid() {
+        SettlementRequest request = regulatedRequest("TXREF-11");
+        registerSignature("TXREF-11");
+
+        when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                .signatureValid(false)
+                .compliant(false)
+                .reason("ALGORITHM_NOT_SUPPORTED")
+                .build());
+
+        SettlementDecision decision = orchestrator.evaluate(request);
+
+        assertThat(decision.isAllow()).isFalse();
+        assertThat(decision.getReasonCode()).isEqualTo("ALGORITHM_NOT_SUPPORTED");
+    }
+
+
+    @Test
+    void declaredCertSerialThatDiffersFromTheOperatorSerialIsDeniedAndAudited() {
+        SettlementRequest request = regulatedRequest("TXREF-12");
+        request.setDeclaredCertSerial("12346");
+        registerSignature("TXREF-12");
+
+        when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                .signatureValid(true)
+                .compliant(true)
+                .auditEntryId("ENTRY-Y")
+                .build());
+
+        SettlementDecision decision = orchestrator.evaluate(request);
+
+        assertThat(decision.isAllow()).isFalse();
+        assertThat(decision.getReasonCode()).isEqualTo("DECLARED_CERT_MISMATCH");
+        verifyNoInteractions(gatekeeperClient);
+        assertThat(auditLog.snapshot()).hasSize(1);
+        RailgateAuditLog.AuditEntry entry = auditLog.snapshot().get(0);
+        assertThat(entry.transactionReference()).isEqualTo("TXREF-12");
+        assertThat(entry.allowed()).isFalse();
+        assertThat(entry.reasonCode()).isEqualTo("DECLARED_CERT_MISMATCH");
+    }
+
+    @Test
+    void declaredCertSerialThatIsNotHexadecimalIsDenied() {
+        SettlementRequest request = regulatedRequest("TXREF-13");
+        request.setDeclaredCertSerial("not-a-serial");
+        registerSignature("TXREF-13");
+
+        when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                .signatureValid(true)
+                .compliant(true)
+                .build());
+
+        assertThat(orchestrator.evaluate(request).getReasonCode())
+                .isEqualTo("DECLARED_CERT_MISMATCH");
+        verifyNoInteractions(gatekeeperClient);
+    }
+
+    @Test
+    void declaredCertSerialNumericallyEqualToTheOperatorSerialIsNotAMismatch() {
+        SettlementRequest request = regulatedRequest("TXREF-14");
+        request.setDeclaredCertSerial(" 0X0012345 ");
+        registerSignature("TXREF-14");
+
+        when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                .signatureValid(true)
+                .compliant(true)
+                .auditEntryId("ENTRY-Z")
+                .build());
+
+        SettlementDecision decision = orchestrator.evaluate(request);
+
+        assertThat(decision.isAllow()).isTrue();
+        assertThat(decision.getReasonCode()).isEqualTo("ALLOWED");
+        assertThat(decision.getAuditEntryId()).isEqualTo("ENTRY-Z");
+    }
+
+    @Test
+    void gatekeeperSettlementAuditEntryHashIsCarriedIntoTheDecisionAndTheAuditLog() {
+        String allowedHash = "ab".repeat(32);
+        String deniedHash = "cd".repeat(32);
+        registerSignature("TXREF-15");
+        registerSignature("TXREF-16");
+
+        when(gatekeeperClient.verify(any()))
+                .thenReturn(VerificationResult.builder()
+                        .signatureValid(true)
+                        .compliant(true)
+                        .auditEntryId("ENTRY-H")
+                        .reason("OK")
+                        .auditEntryHashHex(allowedHash)
+                        .build())
+                .thenReturn(VerificationResult.builder()
+                        .signatureValid(true)
+                        .compliant(false)
+                        .reason("CERT_NOT_FOUND")
+                        .auditEntryHashHex(deniedHash)
+                        .build());
+
+        SettlementDecision allowed = orchestrator.evaluate(regulatedRequest("TXREF-15"));
+        SettlementDecision denied = orchestrator.evaluate(regulatedRequest("TXREF-16"));
+
+        assertThat(allowed.isAllow()).isTrue();
+        assertThat(allowed.getAuditEntryId()).isEqualTo("ENTRY-H");
+        assertThat(allowed.getAuditEntryHashHex()).isEqualTo(allowedHash);
+        assertThat(denied.getReasonCode()).isEqualTo("CERT_NOT_FOUND");
+        assertThat(denied.getAuditEntryId()).isNull();
+        assertThat(denied.getAuditEntryHashHex()).isEqualTo(deniedHash);
+
+        assertThat(auditLog.snapshot()).hasSize(2);
+        assertThat(auditLog.snapshot().get(0).gatekeeperAuditEntryId()).isEqualTo("ENTRY-H");
+        assertThat(auditLog.snapshot().get(0).gatekeeperAuditEntryHashHex()).isEqualTo(allowedHash);
+        assertThat(auditLog.snapshot().get(1).gatekeeperAuditEntryId()).isNull();
+        assertThat(auditLog.snapshot().get(1).gatekeeperAuditEntryHashHex()).isEqualTo(deniedHash);
     }
 
     private static SettlementRequest regulatedRequest(String reference) {

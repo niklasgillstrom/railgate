@@ -1,10 +1,14 @@
 package eu.gillstrom.railgate.client;
 
+import eu.gillstrom.railgate.audit.RailgateAuditLog;
 import eu.gillstrom.railgate.model.PaymentSignature;
 import eu.gillstrom.railgate.model.VerificationResult;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.ssl.SslBundle;
+import org.springframework.boot.ssl.SslBundles;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.http.HttpHeaders;
@@ -15,6 +19,11 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLSocketFactory;
+import javax.security.auth.x500.X500Principal;
+import java.io.IOException;
+import java.net.HttpURLConnection;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.HashMap;
@@ -51,6 +60,12 @@ public class GatekeeperClient {
     /** SHA-512 in hex: 64 bytes, 128 hex characters, nothing else. */
     private static final Pattern SHA512_HEX = Pattern.compile("^[0-9a-fA-F]{128}$");
 
+    private static final int MAX_ISSUER_DN_LENGTH = 512;
+
+    private static final int MAX_SIGNATURE_BASE64_LENGTH = 4096;
+
+    private static final int MAX_LOGGED_ERROR_LENGTH = 512;
+
     private final RestTemplate restTemplate;
 
     private String gatekeeperBaseUrl;
@@ -73,16 +88,47 @@ public class GatekeeperClient {
      * discovered on the first settlement — which is the wrong time to find
      * out that verification traffic is unencrypted.</p>
      *
+     * <p>When {@code railgate.gatekeeper.ssl-bundle} names a Spring Boot SSL
+     * bundle ({@code spring.ssl.bundle.*}), the bundle's key and trust
+     * material are used for the gatekeeper connection, which is how the
+     * client certificate for mTLS and a private truststore are supplied.
+     * Without it the JVM default SSL context applies. The bundle is resolved
+     * here, at start-up, for the same reason as the scheme check.</p>
+     *
      * @throws IllegalStateException when the base URL is not {@code https://}
      *     and {@code railgate.gatekeeper.allow-insecure-http} has not been
-     *     set to {@code true}
+     *     set to {@code true}, or when the named SSL bundle sets ciphers or
+     *     enabled protocols, which {@code HttpURLConnection} cannot apply
+     * @throws org.springframework.boot.ssl.NoSuchSslBundleException when
+     *     {@code railgate.gatekeeper.ssl-bundle} names no configured bundle
      */
     @Autowired
     public GatekeeperClient(
             @Value("${railgate.gatekeeper.base-url:https://localhost:8443}") String gatekeeperBaseUrl,
             @Value("${railgate.gatekeeper.connect-timeout:PT2S}") Duration connectTimeout,
             @Value("${railgate.gatekeeper.read-timeout:PT5S}") Duration readTimeout,
-            @Value("${railgate.gatekeeper.allow-insecure-http:false}") boolean allowInsecureHttp) {
+            @Value("${railgate.gatekeeper.allow-insecure-http:false}") boolean allowInsecureHttp,
+            @Value("${railgate.gatekeeper.ssl-bundle:}") String sslBundle,
+            ObjectProvider<SslBundles> sslBundles) {
+        this(gatekeeperBaseUrl, connectTimeout, readTimeout, allowInsecureHttp, sslBundle,
+                sslBundles.getIfAvailable());
+    }
+
+    public GatekeeperClient(
+            String gatekeeperBaseUrl,
+            Duration connectTimeout,
+            Duration readTimeout,
+            boolean allowInsecureHttp) {
+        this(gatekeeperBaseUrl, connectTimeout, readTimeout, allowInsecureHttp, null, (SslBundles) null);
+    }
+
+    GatekeeperClient(
+            String gatekeeperBaseUrl,
+            Duration connectTimeout,
+            Duration readTimeout,
+            boolean allowInsecureHttp,
+            String sslBundle,
+            SslBundles sslBundles) {
 
         String baseUrl = gatekeeperBaseUrl == null ? "" : gatekeeperBaseUrl.trim();
 
@@ -105,10 +151,39 @@ public class GatekeeperClient {
 
         this.gatekeeperBaseUrl = baseUrl;
 
-        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        SimpleClientHttpRequestFactory factory = requestFactory(sslBundle, sslBundles);
         factory.setConnectTimeout(connectTimeout);
         factory.setReadTimeout(readTimeout);
         this.restTemplate = new RestTemplate(factory);
+    }
+
+    private static SimpleClientHttpRequestFactory requestFactory(String sslBundle, SslBundles sslBundles) {
+        if (sslBundle == null || sslBundle.isBlank()) {
+            return new SimpleClientHttpRequestFactory();
+        }
+        String bundleName = sslBundle.trim();
+        if (sslBundles == null) {
+            throw new IllegalStateException("railgate.gatekeeper.ssl-bundle is '" + bundleName
+                    + "' but no SSL bundle registry is available.");
+        }
+        SslBundle bundle = sslBundles.getBundle(bundleName);
+        if (bundle.getOptions() != null && bundle.getOptions().isSpecified()) {
+            throw new IllegalStateException("SSL bundle '" + bundleName + "' sets ciphers or "
+                    + "enabled protocols. The gatekeeper connection uses HttpURLConnection, "
+                    + "which cannot apply them; remove the bundle's options or use a bundle "
+                    + "without them.");
+        }
+        SSLSocketFactory socketFactory = bundle.createSslContext().getSocketFactory();
+        return new SimpleClientHttpRequestFactory() {
+            @Override
+            protected void prepareConnection(HttpURLConnection connection, String httpMethod)
+                    throws IOException {
+                super.prepareConnection(connection, httpMethod);
+                if (connection instanceof HttpsURLConnection httpsConnection) {
+                    httpsConnection.setSSLSocketFactory(socketFactory);
+                }
+            }
+        };
     }
 
     /** For tests: inject a RestTemplate that MockRestServiceServer is bound to. */
@@ -153,7 +228,8 @@ public class GatekeeperClient {
 
             VerificationResult result = response.getBody();
             if (result == null) {
-                log.warn("Gatekeeper returned empty body for cert {}", signature.getCertSerial());
+                log.warn("Gatekeeper returned empty body for cert {}",
+                        RailgateAuditLog.sanitise(signature.getCertSerial(), Integer.MAX_VALUE));
                 return VerificationResult.builder()
                         .signatureValid(false)
                         .compliant(false)
@@ -163,7 +239,9 @@ public class GatekeeperClient {
             return result;
 
         } catch (RestClientException ex) {
-            log.warn("Gatekeeper unreachable for cert {}: {}", signature.getCertSerial(), ex.getMessage());
+            log.warn("Gatekeeper unreachable for cert {}: {}",
+                    RailgateAuditLog.sanitise(signature.getCertSerial(), Integer.MAX_VALUE),
+                    RailgateAuditLog.sanitise(ex.getMessage(), MAX_LOGGED_ERROR_LENGTH));
             return VerificationResult.builder()
                     .signatureValid(false)
                     .compliant(false)
@@ -192,16 +270,33 @@ public class GatekeeperClient {
         if (signatureBase64 == null || signatureBase64.isBlank()) {
             return "signatureBase64 is blank";
         }
+        if (signatureBase64.length() > MAX_SIGNATURE_BASE64_LENGTH) {
+            return "signatureBase64 exceeds " + MAX_SIGNATURE_BASE64_LENGTH + " characters";
+        }
         try {
             Base64.getDecoder().decode(signatureBase64);
         } catch (IllegalArgumentException ex) {
             return "signatureBase64 is not valid base64";
         }
-        if (isBlank(signature.getCertSerial())) {
+        String certSerial = signature.getCertSerial();
+        if (isBlank(certSerial)) {
             return "certSerial is blank";
         }
-        if (isBlank(signature.getIssuerDn())) {
+        if (PaymentSignature.parseCertSerial(certSerial) == null) {
+            return "certSerial is not a hexadecimal serial of at most "
+                    + PaymentSignature.MAX_CERT_SERIAL_LENGTH + " characters";
+        }
+        String issuerDn = signature.getIssuerDn();
+        if (isBlank(issuerDn)) {
             return "issuerDn is blank";
+        }
+        if (issuerDn.length() > MAX_ISSUER_DN_LENGTH) {
+            return "issuerDn exceeds " + MAX_ISSUER_DN_LENGTH + " characters";
+        }
+        try {
+            new X500Principal(issuerDn);
+        } catch (IllegalArgumentException ex) {
+            return "issuerDn is not an RFC 4514 distinguished name";
         }
         return null;
     }

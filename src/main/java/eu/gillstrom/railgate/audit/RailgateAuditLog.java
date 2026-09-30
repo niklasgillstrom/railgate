@@ -42,7 +42,8 @@ public class RailgateAuditLog {
             boolean allowed,
             String reasonCode,
             String message,
-            String gatekeeperAuditEntryId
+            String gatekeeperAuditEntryId,
+            String gatekeeperAuditEntryHashHex
     ) {}
 
     /**
@@ -84,13 +85,10 @@ public class RailgateAuditLog {
     private final AtomicLong evictedCount = new AtomicLong();
 
     public void record(SettlementDecision decision) {
-        // The transaction reference comes from an upstream settlement message
-        // and the message can carry a gatekeeper-supplied reason. Both end up
-        // in a line-oriented log, where an embedded CR or LF lets the writer
-        // forge additional log lines. Neutralised once, before the value is
-        // either stored or logged, so the stored entry and the log line agree.
         String transactionReference = sanitise(decision.getTransactionReference(), Integer.MAX_VALUE);
         String message = sanitise(decision.getMessage(), MAX_MESSAGE_LENGTH);
+        String gatekeeperAuditEntryId = sanitise(decision.getAuditEntryId(), Integer.MAX_VALUE);
+        String gatekeeperAuditEntryHashHex = sanitise(decision.getAuditEntryHashHex(), Integer.MAX_VALUE);
 
         AuditEntry entry = new AuditEntry(
                 Instant.now(),
@@ -98,7 +96,8 @@ public class RailgateAuditLog {
                 decision.isAllow(),
                 decision.getReasonCode(),
                 message,
-                decision.getAuditEntryId()
+                gatekeeperAuditEntryId,
+                gatekeeperAuditEntryHashHex
         );
         entries.addLast(entry);
         if (entryCount.incrementAndGet() > MAX_ENTRIES && entries.pollFirst() != null) {
@@ -114,8 +113,9 @@ public class RailgateAuditLog {
         }
 
         if (decision.isAllow()) {
-            log.info("Settlement ALLOWED: ref={} reason={} gatekeeperEntry={}",
-                    transactionReference, decision.getReasonCode(), decision.getAuditEntryId());
+            log.info("Settlement ALLOWED: ref={} reason={} gatekeeperEntry={} gatekeeperEntryHash={}",
+                    transactionReference, decision.getReasonCode(), gatekeeperAuditEntryId,
+                    gatekeeperAuditEntryHashHex);
         } else {
             log.warn("Settlement DENIED: ref={} reason={} message={}",
                     transactionReference, decision.getReasonCode(), message);
@@ -142,7 +142,7 @@ public class RailgateAuditLog {
      * Returns null unchanged so that an absent value stays absent rather than
      * becoming an empty string.
      */
-    private static String sanitise(String value, int maxLength) {
+    public static String sanitise(String value, int maxLength) {
         if (value == null) {
             return null;
         }

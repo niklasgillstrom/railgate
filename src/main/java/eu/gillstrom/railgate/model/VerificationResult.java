@@ -16,9 +16,13 @@ import lombok.NoArgsConstructor;
  * <p>Both must be true for railgate to allow settlement. Any false value
  * triggers default-deny.
  *
- * <p>{@code auditEntryId} is the gatekeeper audit-log entry identifier
- * (when found), retained for cross-referencing during forensic
- * investigations. {@code reason} is a structured error code when the result
+ * <p>{@code auditEntryId} is the gatekeeper's approval-registry
+ * {@code verificationId} the compliance verdict was read from (when found);
+ * it is shared by every settlement against the same certificate.
+ * {@code auditEntryHashHex} is the {@code thisEntryHashHex} of the
+ * {@code SETTLEMENT_VERIFY} audit entry the gatekeeper wrote for this call
+ * (gatekeeper 1.5.0 and later). Both are retained for cross-referencing
+ * during forensic investigations. {@code reason} is a structured error code when the result
  * is non-positive (e.g. {@code CERT_NOT_FOUND}, {@code SIGNATURE_INVALID},
  * {@code CERT_NON_COMPLIANT}).
  */
@@ -35,6 +39,8 @@ public class VerificationResult {
     private String auditEntryId;
 
     private String reason;
+
+    private String auditEntryHashHex;
 
     /** Convenience: whether settlement should be allowed. */
     public boolean isAllowed() {

@@ -16,9 +16,19 @@ import java.util.Optional;
  *
  * <p>Why railgate queries the payment-network operator rather than the
  * originating bank: the payment-network operator is independent of the
- * originating bank's incentives and cannot misreport the signature or cert
- * serial without immediately producing detectable inconsistency. This
- * eliminates bank cooperation as a trust point in the verification chain.
+ * originating bank's incentives. That removes the bank as the source of the
+ * artefacts; it does not make a misreport by the operator detectable in
+ * general. The only cross-check railgate performs is against the serial the
+ * bank declares in pacs.008 RgltryRptg, when it declares one: a difference
+ * is denied as {@code DECLARED_CERT_MISMATCH}. Without a declared serial,
+ * railgate verifies what the operator returns and nothing else.
+ *
+ * <p>Nor does the lookup bind the artefacts to one settlement. railgate does
+ * not record which transaction references it has already allowed, so a
+ * settlement that reuses the reference of an earlier, genuinely signed
+ * payout receives that payout's artefacts and verifies. Whether a reference
+ * can settle twice is left to the settlement rail's own duplicate checks;
+ * railgate does not detect it.
  *
  * <p>The implementation lookup is by {@code transactionReference} (typically
  * pacs.008 EndToEndId or UETR), which the payment-network operator already

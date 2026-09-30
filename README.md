@@ -49,8 +49,8 @@ central-bank settlement rail.
        ↓
    railgate → gatekeeper.verify(certSerial, issuerDn, digest, signature)
        ↓
-   gatekeeper:
-     1. Look up cert via (certSerial, issuerDn)
+   gatekeeper (1.5.0 or later):
+     1. Look up cert stored at Step 7 via (certSerial, issuerDn)
      2. Signature.getInstance("SHA512withRSA")
           .initVerify(publicKey); update(digest); verify(signature)
      3. Check compliance status of audit entry
@@ -60,6 +60,37 @@ central-bank settlement rail.
        ↓
 [Audit log entry recorded]
 ```
+
+**Gatekeeper version.** Step 1 of the gatekeeper box is true from
+gatekeeper 1.5.0, which stores the issued certificate at Step 7
+confirmation and looks it up by `(certSerial, issuerDn)`. Up to and
+including gatekeeper 1.4.0 it did not exist: `POST /api/v1/verify` required
+a `signingCertificatePem` that railgate never sends, answered every
+railgate request with `MALFORMED_INPUT`, and railgate reported that to the
+originating bank as `SIGNATURE_INVALID`. Every regulated settlement was
+denied. railgate 1.5.0 requires gatekeeper 1.5.0 or later.
+
+**Wire contract.** railgate sends exactly four JSON properties, which are
+the required fields of gatekeeper's `SignatureVerificationRequest`:
+
+| Property          | Format                                                                 | Gatekeeper limit        |
+|-------------------|------------------------------------------------------------------------|-------------------------|
+| `certSerial`      | Hexadecimal, case-insensitive, optional `0x` prefix. Compared numerically (`BigInteger`), so `0x00C0FFEE` and `c0ffee` are the same serial. Not decimal. | `@NotBlank`, `@Size(max = 128)` |
+| `issuerDn`        | RFC 4514 string, e.g. `CN=Example CA,O=Example Bank,C=SE`. Compared by `X500Principal` equality. | `@NotBlank`, `@Size(max = 512)` |
+| `digestHex`       | SHA-512, exactly 128 hexadecimal characters.                           | `@NotBlank`, `@Size(max = 256)` |
+| `signatureBase64` | Standard base64.                                                       | `@NotBlank`, `@Size(max = 4096)` |
+
+`signingCertificatePem` and `algorithm` are never sent. `GatekeeperClient`
+checks every row before the call and answers `INVALID_SIGNATURE_MATERIAL`
+without calling the gatekeeper when one fails, so a request the gatekeeper
+would reject with a 400 does not become a `NETWORK_ERROR`. If no stored
+certificate matches, the gatekeeper answers `CERT_NOT_FOUND`, which railgate
+passes through. The contract is pinned by
+`GatekeeperClientTest.requestBodyMatchesTheGatekeeperSignatureVerificationRequest`
+and the size-limit tests beside it. A payment-network operator that stores
+the serial in decimal must convert it before it reaches railgate: a string
+of decimal digits is also valid hexadecimal and names a different
+certificate, which the gatekeeper will report as `CERT_NOT_FOUND`.
 
 **What regulated-payment detection rests on.** Both party-type flags are
 metadata. The settlement system derives them from `Dbtr/Id/OrgId` and
@@ -115,8 +146,13 @@ minimisation and the proportionality requirement implicit in DORA Art 32
 supervisory data processing.
 
 railgate's own audit log records the transaction reference, the decision,
-the reason code and the gatekeeper audit-entry identifier — not the BICs
-and not the flags.
+the reason code and two gatekeeper references — not the BICs and not the
+flags. `gatekeeperAuditEntryId` is the gatekeeper's approval-registry
+`verificationId`, shared by every settlement against the same certificate
+and `null` on `CERT_NOT_FOUND`; `gatekeeperAuditEntryHashHex` (gatekeeper
+1.5.0 and later) is the hash of the gatekeeper's own `SETTLEMENT_VERIFY`
+audit entry for the call, which identifies that one decision in the
+gatekeeper's hash-chained log.
 
 SHA-512 collision resistance ensures that a valid signature over the
 digest binds that signature to the payload the digest was taken over.
@@ -130,10 +166,30 @@ from Swish alias to IBAN by the payment-network operator before
 settlement, so the identifier the customer signed is not the identifier
 railgate sees.
 
-The residual is therefore an assumption about the payment-network
-operator, and it is not a property of the architecture. Closing it
-requires the settlement message to carry the signed fields, which is a
-participation condition for the rail rather than a change to this
+Two residuals follow, and neither is only an assumption about the
+payment-network operator.
+
+The first is substitution. A valid signature over the digest the operator
+returns proves that the customer signed *some* payload; railgate cannot
+check that it is the payload being settled. If the originating bank
+declares a serial in `RgltryRptg`, a different serial from the operator is
+denied as `DECLARED_CERT_MISMATCH`; nothing else is cross-checked.
+
+The second is reuse of a transaction reference. railgate looks the
+artefacts up by transaction reference and never records a reference as
+consumed. A settlement that carries the reference of an earlier, genuinely
+signed payout therefore receives that payout's artefacts, verifies, and is
+allowed — whoever submits it, including the originating bank itself.
+Whether a reference can settle twice depends on the settlement rail's own
+duplicate detection, not on railgate. A replay store is not added in this
+release: it would have to survive restarts, be shared across instances,
+and distinguish a replay from a legitimate resubmission after a deny or a
+downstream settlement failure, and an in-memory set does none of that.
+
+Closing the first requires the settlement message to carry the signed
+fields; closing the second requires the payment-network operator or the
+rail to bind each set of artefacts to a single settlement. Both are
+participation conditions for the rail rather than changes to this
 artefact: RIX terms are set by the system owner, and ISO 20022 provides
 the extension points. railgate implements what is verifiable given what
 the rail delivers today.
@@ -149,28 +205,30 @@ set railgate can produce — no other value is reachable:
 | ALLOWED                    | 200  | true  | Signature verified and certificate compliant; settlement proceeds.  |
 | NOT_REGULATED              | 200  | true  | Explicitly classified, and not organisation-to-private. Passed through without verification. |
 | DORA_32_AUDIT_MISSING      | 403  | false | No signature artefacts found at the payment-network operator.       |
+| DECLARED_CERT_MISMATCH     | 403  | false | The settlement request declares a certificate serial (`declaredCertSerial`, from pacs.008 `RgltryRptg`) that differs numerically from the payment-network operator's, or is not hexadecimal. The gatekeeper was not called. |
 | CERT_NOT_FOUND             | 403  | false | Certificate matches no gatekeeper audit entry — issuance was circumvented, or the wrong certificate was used. |
 | SIGNATURE_INVALID          | 403  | false | Cryptographic verification failed at the gatekeeper.                |
 | CERT_NON_COMPLIANT         | 403  | false | Certificate exists but was not issued through a compliant flow.     |
+| MALFORMED_INPUT            | 403  | false | The gatekeeper could not parse the request. Not a signature failure. |
+| ALGORITHM_NOT_SUPPORTED    | 403  | false | The gatekeeper would not run the signature algorithm. Not a signature failure. |
 | NETWORK_ERROR              | 403  | false | gatekeeper unreachable, timed out, or returned an unusable body.    |
-| INVALID_SIGNATURE_MATERIAL | 403  | false | The artefacts from the payment-network operator are malformed (digest not 128 hex characters, signature not base64, blank certificate serial or issuer DN). The gatekeeper was not called. |
+| INVALID_SIGNATURE_MATERIAL | 403  | false | The artefacts from the payment-network operator are malformed or outside the wire contract above (digest not 128 hex characters, signature not base64 or over 4096 characters, certificate serial not hexadecimal or over 128 characters, issuer DN not an RFC 4514 name or over 512 characters, any of them blank). The gatekeeper was not called. |
 | INVALID_REQUEST            | 400  | false | The settlement request failed Bean Validation — a missing party-type flag, a blank transaction reference, an over-long instrument code. No verification was attempted. |
 | INTERNAL_ERROR             | 403  | false | Any unhandled failure inside railgate. Default-deny; no detail about the failure is returned to the caller. |
 
-`CERT_NOT_FOUND`, `CERT_NON_COMPLIANT`, `SIGNATURE_INVALID` and
-`NETWORK_ERROR` are read from the gatekeeper's own `reason` field and
-passed through unchanged; `INVALID_SIGNATURE_MATERIAL` is produced by
-railgate's client before any call is made. Any other `reason` value falls
-back to a derivation from the two booleans, which yields
-`SIGNATURE_INVALID` when the signature did not verify and
-`CERT_NON_COMPLIANT` otherwise.
+`CERT_NOT_FOUND`, `CERT_NON_COMPLIANT`, `SIGNATURE_INVALID`,
+`MALFORMED_INPUT` and `ALGORITHM_NOT_SUPPORTED` are read from the
+gatekeeper's own `reason` field and passed through unchanged, as are
+`NETWORK_ERROR` and `INVALID_SIGNATURE_MATERIAL`, which railgate's client
+produces itself. That is every non-positive reason the gatekeeper
+documents. Any other `reason` value falls back to a derivation from the two
+booleans, which yields `SIGNATURE_INVALID` when the signature did not
+verify and `CERT_NON_COMPLIANT` otherwise.
 
-**Known limitation.** The gatekeeper can also answer `MALFORMED_INPUT` and
-`ALGORITHM_NOT_SUPPORTED`. Neither is in the pass-through set, so both
-reach the originating bank as `SIGNATURE_INVALID` — a defect in the
-supervisor-side input handling reported as a bad signature. This is the
-same conflation the `NETWORK_ERROR` fix in 1.3.0 addressed, narrowed but
-not eliminated.
+Up to railgate 1.4.0, `MALFORMED_INPUT` and `ALGORITHM_NOT_SUPPORTED` were
+not in the pass-through set and reached the originating bank as
+`SIGNATURE_INVALID`. Against gatekeeper 1.4.0 that was every regulated
+settlement: see *Gatekeeper version* above.
 
 The bank may resubmit the settlement with valid data. In the absence of
 valid data, the transaction does not settle.
@@ -180,18 +238,20 @@ valid data, the transaction does not settle.
 ```bash
 mvn -B clean verify                          # build + tests + OWASP scan
 mvn spring-boot:run                          # start on port 8082
-java -jar target/railgate-1.4.0.jar          # or run the built jar
+java -jar target/railgate-1.5.0.jar          # or run the built jar
 ```
 
 Configuration via `application.yml`:
 
 | Property                                    | Default                  | Purpose                                                                 |
 |---------------------------------------------|--------------------------|-------------------------------------------------------------------------|
-| `railgate.payment-network.mode`             | `in-memory`              | Payment-network operator client implementation                          |
+| `railgate.payment-network.mode`             | `in-memory`              | Payment-network operator client implementation: `in-memory`, or `file` for local end-to-end runs only |
+| `railgate.payment-network.file`             | *(empty)*                | Required when the mode is `file`: tab-separated artefacts (reference, certificate serial, issuer DN, digest, signature), re-read on every lookup. Not for production. |
 | `railgate.gatekeeper.base-url`              | `https://localhost:8443` | Supervisor's gatekeeper instance URL. Must be `https://` unless the flag below is set. |
 | `railgate.gatekeeper.allow-insecure-http`   | `false`                  | Permit a non-`https` base URL. Local development only — start-up fails without it, and logs a WARN with it. |
 | `railgate.gatekeeper.connect-timeout`       | `PT2S`                   | TCP connect timeout for gatekeeper calls (ISO-8601 duration)            |
 | `railgate.gatekeeper.read-timeout`          | `PT5S`                   | Response read timeout for gatekeeper calls (ISO-8601 duration). Exceeding either yields `NETWORK_ERROR` and a deny. |
+| `railgate.gatekeeper.ssl-bundle`            | *(empty)*                | Name of a Spring Boot SSL bundle (`spring.ssl.bundle.*`) whose trust and key material is used for the gatekeeper connection. Empty means the JVM default SSL context. An unknown name fails start-up. |
 | `railgate.regulated.local-instrument-codes` | `SWISH`                  | LclInstrm/Cd values that identify regulated payments. Matched case-insensitively, whitespace-trimmed. |
 
 ## Transport and authentication
@@ -199,13 +259,26 @@ Configuration via `application.yml`:
 **Outbound, railgate → gatekeeper.** The base URL must be `https://`;
 `GatekeeperClient` throws `IllegalStateException` at start-up otherwise, so
 a plain-HTTP supervisor link is a boot failure rather than a silent
-downgrade. The TLS trust material is not configured by railgate: use Spring
-Boot's standard SSL properties (`spring.ssl.bundle.jks.*` or
-`javax.net.ssl.trustStore`) for the truststore, and the same bundle for the
-client certificate where the gatekeeper requires mTLS — gatekeeper's
-`SETTLEMENT_RAIL` role is bound to the client certificate's CN. A reverse
-proxy or service mesh terminating mTLS in front of railgate is an equally
-valid arrangement; in that case point `base-url` at the proxy.
+downgrade. Trust and key material come from one of two places:
+
+- **An SSL bundle.** Define it with Spring Boot's standard properties —
+  `spring.ssl.bundle.jks.<name>.truststore.*` for the gatekeeper's CA and
+  `spring.ssl.bundle.jks.<name>.keystore.*` for the client certificate
+  where the gatekeeper requires mTLS (or the `pem` equivalents) — and set
+  `railgate.gatekeeper.ssl-bundle=<name>`. `GatekeeperClient` resolves the
+  bundle at start-up and uses its `SSLContext` for every gatekeeper
+  connection. gatekeeper's `SETTLEMENT_RAIL` role is bound to the client
+  certificate's CN. Two limits: the connection is made with the JDK
+  `HttpURLConnection`, so a bundle that sets `options.ciphers` or
+  `options.enabled-protocols` is refused at start-up rather than silently
+  ignored; and the context is built once, so a bundle with
+  `reload-on-update: true` takes effect for railgate only at the next
+  restart.
+- **The JVM defaults** (`javax.net.ssl.trustStore`, `javax.net.ssl.keyStore`
+  and their passwords), when `railgate.gatekeeper.ssl-bundle` is empty.
+
+A reverse proxy or service mesh terminating mTLS in front of railgate is an
+equally valid arrangement; in that case point `base-url` at the proxy.
 
 **railgate does not verify signed gatekeeper responses.** The gatekeeper
 signs its receipts, and the verdict railgate consumes is not one of them:
