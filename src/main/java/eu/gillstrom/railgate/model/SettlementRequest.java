@@ -22,8 +22,9 @@ import lombok.NoArgsConstructor;
  *   <li>Explicit: {@code localInstrumentCode} matches a known regulated
  *       payment-type code (e.g. "SWISH" for Swedish Swish utbetalning).</li>
  *   <li>Structural derivation: {@code debtorIsOrganization} is true and
- *       {@code creditorIsPrivatePerson} is true — by definition this is
- *       Swish utbetalning in the Swedish context.</li>
+ *       {@code creditorIsPrivatePerson} is true. In the Swedish context
+ *       that is Swish utbetalning or a refund of a Swish Handel payment,
+ *       which this model cannot tell apart.</li>
  * </ul>
  *
  * <p><b>What the party-type flags are, and are not.</b> Both flags are
@@ -54,15 +55,18 @@ public class SettlementRequest {
      * Unique end-to-end transaction reference, typically the pacs.008
      * EndToEndId or UETR. Used to correlate this settlement attempt with
      * the originating signed payment instruction at the payment-network
-     * operator.
+     * operator. At most 36 characters: EndToEndId is ISO 20022
+     * {@code Max35Text} and a UETR is a 36-character UUID.
      */
     @NotBlank
+    @Size(max = 36)
     private String transactionReference;
 
     /**
-     * Local instrument code from PmtTpInf/LclInstrm/Cd in pacs.008. May be
-     * empty if the originating bank has not populated it. When populated,
-     * a value such as "SWISH" identifies the payment as Swish utbetalning.
+     * Local instrument code from PmtTpInf/LclInstrm/Cd in pacs.008. RIX-INST
+     * requires the element (Anvisningar RIX-INST, Table 64); other rails
+     * may not, so it may be empty here. The configured regulated codes must
+     * be ones that only payouts carry.
      * Bounded to the ISO 20022 {@code Max35Text} length of the underlying
      * element.
      */
@@ -77,8 +81,11 @@ public class SettlementRequest {
      * value is a cross-check against it. When present, railgate compares the
      * two numerically and denies with {@code DECLARED_CERT_MISMATCH} if they
      * differ, or if this value is not a hexadecimal serial. Null or blank
-     * means no cross-check.
+     * means no cross-check. At most
+     * {@link PaymentSignature#MAX_CERT_SERIAL_LENGTH} characters, the bound
+     * {@link PaymentSignature#parseCertSerial} accepts.
      */
+    @Size(max = PaymentSignature.MAX_CERT_SERIAL_LENGTH)
     private String declaredCertSerial;
 
     /**
@@ -101,9 +108,11 @@ public class SettlementRequest {
     @NotNull
     private Boolean creditorIsPrivatePerson;
 
-    /** Originating bank BIC (sender). */
+    /** Originating bank BIC (sender); a BIC is 8 or 11 characters. */
+    @Size(max = 11)
     private String debtorBic;
 
-    /** Receiving bank BIC. */
+    /** Receiving bank BIC; a BIC is 8 or 11 characters. */
+    @Size(max = 11)
     private String creditorBic;
 }

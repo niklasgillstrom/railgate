@@ -30,6 +30,8 @@ import lombok.NoArgsConstructor;
  *   <li>{@code SIGNATURE_INVALID} — cryptographic verification failed.</li>
  *   <li>{@code CERT_NON_COMPLIANT} — cert exists but did not pass
  *       structural-independence checks at issuance.</li>
+ *   <li>{@code CERT_EXPIRED} — the signature verifies, but the certificate
+ *       is outside its validity period (gatekeeper 1.6.0).</li>
  *   <li>{@code MALFORMED_INPUT} / {@code ALGORITHM_NOT_SUPPORTED} — the
  *       gatekeeper could not evaluate the request; not a signature
  *       failure.</li>

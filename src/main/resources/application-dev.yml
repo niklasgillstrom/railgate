@@ -1,8 +1,12 @@
 ## Developer profile — activate with: --spring.profiles.active=dev
 ##
-## The only thing this profile does is turn the OpenAPI document and Swagger UI
-## back on. Every other profile leaves them off (see application.yml).
-## Do not deploy with this profile active.
+## This profile turns the OpenAPI document and Swagger UI back on, and lets
+## railgate start without TLS on its own listener. Every other profile leaves
+## both off (see application.yml). Do not deploy with this profile active.
+
+railgate:
+  server:
+    allow-insecure-http: true
 
 springdoc:
   api-docs:

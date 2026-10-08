@@ -145,7 +145,10 @@ public class SettlementOrchestrator {
      * Reason codes that may arrive in {@link VerificationResult#getReason()}
      * and are passed through unchanged.
      *
-     * <p>The first five are produced by the gatekeeper. {@code MALFORMED_INPUT}
+     * <p>The first six are produced by the gatekeeper; {@code CERT_EXPIRED}
+     * (gatekeeper 1.6.0) is a certificate outside its validity period, which
+     * arrives with {@code signatureValid=true} and was reported as
+     * {@code CERT_NON_COMPLIANT}. {@code MALFORMED_INPUT}
      * (the gatekeeper could not parse the request; gatekeeper 1.4.0 answered
      * it to every request railgate sends, because it required a PEM
      * certificate railgate does not forward) and
@@ -164,6 +167,7 @@ public class SettlementOrchestrator {
     private static final Set<String> PASSTHROUGH_REASONS = Set.of(
             "CERT_NOT_FOUND",
             "CERT_NON_COMPLIANT",
+            "CERT_EXPIRED",
             "SIGNATURE_INVALID",
             "MALFORMED_INPUT",
             "ALGORITHM_NOT_SUPPORTED",

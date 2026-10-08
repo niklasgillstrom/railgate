@@ -165,6 +165,21 @@ class SettlementOrchestratorTest {
         assertThat(decision.getReasonCode()).isEqualTo("NOT_REGULATED");
     }
 
+    @Test
+    void aSettlementWithoutInstrumentCodeThatIsNotOrganisationToPrivatePassesThrough() {
+        SettlementRequest request = SettlementRequest.builder()
+                .transactionReference("TXREF-5B")
+                .localInstrumentCode(null)
+                .debtorIsOrganization(true)
+                .creditorIsPrivatePerson(false)
+                .build();
+
+        SettlementDecision decision = orchestrator.evaluate(request);
+
+        assertThat(decision.isAllow()).isTrue();
+        assertThat(decision.getReasonCode()).isEqualTo("NOT_REGULATED");
+    }
+
     // ---------------------------------------------------------------
     // Default-deny on missing classification (1.4.0)
     // ---------------------------------------------------------------
@@ -317,6 +332,25 @@ class SettlementOrchestratorTest {
     }
 
     @Test
+    void anExpiredCertificateIsReportedAsCertExpired() {
+        // gatekeeper 1.6.0 answers CERT_EXPIRED for a certificate outside its
+        // validity period, with signatureValid=true.
+        SettlementRequest request = regulatedRequest("TXREF-EXP");
+        registerSignature("TXREF-EXP");
+
+        when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                .signatureValid(true)
+                .compliant(false)
+                .reason("CERT_EXPIRED")
+                .build());
+
+        SettlementDecision decision = orchestrator.evaluate(request);
+
+        assertThat(decision.isAllow()).isFalse();
+        assertThat(decision.getReasonCode()).isEqualTo("CERT_EXPIRED");
+    }
+
+    @Test
     void algorithmNotSupportedFromGatekeeperIsNotReportedAsSignatureInvalid() {
         SettlementRequest request = regulatedRequest("TXREF-11");
         registerSignature("TXREF-11");
@@ -448,5 +482,73 @@ class SettlementOrchestratorTest {
                 .certSerial("12345")
                 .issuerDn("CN=SEB Customer CA")
                 .build());
+    }
+
+    private void registerSignature(String reference, String certSerial) {
+        paymentNetworkClient.register(reference, PaymentSignature.builder()
+                .digestHex("deadbeef")
+                .signatureBase64("AAAA")
+                .certSerial(certSerial)
+                .issuerDn("CN=SEB Customer CA")
+                .build());
+    }
+
+    @Test
+    void aDenialWithoutAReasonIsReportedAsSignatureInvalidWithTheDefaultMessage() {
+        registerSignature("TX-NOREASON", "12345");
+        when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                .signatureValid(false)
+                .compliant(false)
+                .build());
+
+        SettlementDecision decision = orchestrator.evaluate(SettlementRequest.builder()
+                .transactionReference("TX-NOREASON")
+                .localInstrumentCode("SWISH")
+                .build());
+
+        assertThat(decision.isAllow()).isFalse();
+        assertThat(decision.getReasonCode()).isEqualTo("SIGNATURE_INVALID");
+        assertThat(decision.getMessage()).isEqualTo("Verification did not return a positive result");
+    }
+
+    @Test
+    void anOperatorSerialThatIsNotHexadecimalIsLeftToTheMaterialCheck() {
+        // The declared-serial comparison needs a parseable operator serial.
+        // Without one it is not a mismatch; the gatekeeper client's material
+        // check rejects the serial instead.
+        registerSignature("TX-BADSERIAL", "not-hex");
+        when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                .signatureValid(false)
+                .compliant(false)
+                .reason("INVALID_SIGNATURE_MATERIAL")
+                .build());
+
+        SettlementDecision decision = orchestrator.evaluate(SettlementRequest.builder()
+                .transactionReference("TX-BADSERIAL")
+                .localInstrumentCode("SWISH")
+                .declaredCertSerial("0A")
+                .build());
+
+        assertThat(decision.getReasonCode()).isEqualTo("INVALID_SIGNATURE_MATERIAL");
+        org.mockito.Mockito.verify(gatekeeperClient).verify(any());
+    }
+
+    @Test
+    void aBlankInstrumentCodeIsNotARegulatedCode() {
+        SettlementDecision decision = orchestrator.evaluate(SettlementRequest.builder()
+                .transactionReference("TX-BLANKCODE")
+                .localInstrumentCode("   ")
+                .debtorIsOrganization(true)
+                .creditorIsPrivatePerson(false)
+                .build());
+
+        assertThat(decision.isAllow()).isTrue();
+        assertThat(decision.getReasonCode()).isEqualTo("NOT_REGULATED");
+        verifyNoInteractions(gatekeeperClient);
+    }
+
+    @Test
+    void theDetectorTreatsAnAbsentRequestAsRegulated() {
+        assertThat(detector.isRegulated(null)).isTrue();
     }
 }

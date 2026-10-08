@@ -85,6 +85,8 @@ class GatekeeperClientTest {
                 .andExpect(jsonPath("$.issuerDn").value("CN=SEB Customer CA3 v1 for BankID"))
                 .andExpect(jsonPath("$.digestHex").value(DIGEST_HEX))
                 .andExpect(jsonPath("$.signatureBase64").value("c2lnbmF0dXJl"))
+                .andExpect(org.springframework.test.web.client.match.MockRestRequestMatchers
+                        .header("Content-Type", org.hamcrest.Matchers.startsWith("application/json")))
                 .andExpect(jsonPath("$.length()").value(4))
                 .andRespond(withSuccess(
                         "{\"signatureValid\":true,\"compliant\":true,\"auditEntryId\":\"AE-1\"}",
@@ -420,6 +422,17 @@ class GatekeeperClientTest {
     }
 
     @Test
+    void theConfiguredTimeoutsBoundTheGatekeeperConnection() throws Exception {
+        // Without them a gatekeeper that accepts the connection and never
+        // answers would hold the settlement indefinitely.
+        GatekeeperClient plain = new GatekeeperClient(
+                "https://gatekeeper.test:8443", Duration.ofMillis(1234), Duration.ofMillis(4321), false);
+        HttpsURLConnection connection = connectionOf(plain);
+        assertThat(connection.getConnectTimeout()).isEqualTo(1234);
+        assertThat(connection.getReadTimeout()).isEqualTo(4321);
+    }
+
+    @Test
     void aBlankSslBundleNameDoesNotConsultTheRegistry() throws Exception {
         SslBundles bundles = mock(SslBundles.class);
 
@@ -459,6 +472,8 @@ class GatekeeperClientTest {
         assertThat(connectionOf(withBundle).getSSLSocketFactory())
                 .isNotNull()
                 .isNotSameAs(HttpsURLConnection.getDefaultSSLSocketFactory());
+        assertThat(connectionOf(withBundle).getReadTimeout()).as("the bundle keeps the timeouts").isEqualTo(5000);
+        assertThat(connectionOf(withBundle).getConnectTimeout()).isEqualTo(2000);
     }
 
     @Test
@@ -501,5 +516,53 @@ class GatekeeperClientTest {
         ClientHttpRequest request = template.getRequestFactory()
                 .createRequest(URI.create("https://gatekeeper.test:8443/api/v1/verify"), HttpMethod.POST);
         return (HttpsURLConnection) ReflectionTestUtils.getField(request, "connection");
+    }
+
+    private static PaymentSignature.PaymentSignatureBuilder valid() {
+        return PaymentSignature.builder()
+                .digestHex(DIGEST_HEX)
+                .signatureBase64("c2lnbmF0dXJl")
+                .certSerial("0123456789")
+                .issuerDn("CN=SEB Customer CA3 v1 for BankID");
+    }
+
+    /**
+     * Each malformed artefact is logged with the field it concerns, and never
+     * with the value: the values come from the payment-network operator.
+     */
+    @Test
+    void eachMaterialProblemIsLoggedByFieldWithoutItsValue() {
+        String secret = "SECRETVALUE";
+        java.util.Map<String, PaymentSignature> cases = new java.util.LinkedHashMap<>();
+        cases.put("no signature artefacts supplied", null);
+        cases.put("digestHex is not 128 hexadecimal characters (SHA-512)", valid().digestHex(secret).build());
+        cases.put("signatureBase64 is blank", valid().signatureBase64(" ").build());
+        cases.put("signatureBase64 exceeds 4096 characters", valid().signatureBase64("A".repeat(4097)).build());
+        cases.put("signatureBase64 is not valid base64", valid().signatureBase64(secret + "!").build());
+        cases.put("certSerial is blank", valid().certSerial(" ").build());
+        cases.put("certSerial is not a hexadecimal serial of at most 128 characters",
+                valid().certSerial(secret).build());
+        cases.put("issuerDn is blank", valid().issuerDn(" ").build());
+        cases.put("issuerDn exceeds 512 characters", valid().issuerDn("CN=" + secret + "a".repeat(510)).build());
+        cases.put("issuerDn is not an RFC 4514 distinguished name", valid().issuerDn(secret).build());
+
+        Logger logger = (Logger) LoggerFactory.getLogger(GatekeeperClient.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            cases.forEach((problem, material) -> {
+                appender.list.clear();
+                VerificationResult result = client.verify(material);
+                assertThat(result.getReason()).as(problem).isEqualTo("INVALID_SIGNATURE_MATERIAL");
+                assertThat(appender.list).as(problem).hasSize(1);
+                assertThat(appender.list.get(0).getFormattedMessage()).as(problem)
+                        .isEqualTo("Rejecting verification request without calling gatekeeper: " + problem)
+                        .doesNotContain(secret);
+            });
+        } finally {
+            logger.detachAppender(appender);
+        }
+        server.verify();
     }
 }

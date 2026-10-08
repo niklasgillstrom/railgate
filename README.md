@@ -36,13 +36,14 @@ central-bank settlement rail.
        ↓
 [Bank → Getswish AB API call] ─Getswish stores {digest, signature, certSerial}
        ↓
-[Bank → RIX-INST pacs.008 settlement initiation]
+[Instructing Party → RIX-INST pacs.008, SIP model, on Swish's mandate]
        ↓
-[Riksbanken / settlement-layer] ─railgate intercepts pacs.008
+[Riksbanken / settlement-layer] ─hands railgate a SettlementRequest derived from the pacs.008
        ↓
    railgate detects regulated payment via:
      • LclInstrm/Cd = "SWISH" (case-insensitive, trimmed), or
-     • OrgId(debtor) + PrvtId(creditor) → org → private = Swish utbetalning
+     • OrgId(debtor) + PrvtId(creditor) → org → private
+       (Swish utbetalning, and refunds of Swish Handel payments)
      • either flag missing → treated as regulated
        ↓
    railgate → Getswish.getSignature(transactionReference)
@@ -105,6 +106,55 @@ payment to reach one; both flags are mandatory, so omitting one is a 400
 rather than a pass-through; and a request that reaches the detector without
 them is treated as regulated. An absent classification produces
 verification, never an allow.
+
+**Who writes the pacs.008.** Swish payments are settled in RIX-INST under
+the SIP model: one Instructing Party, approved by the Riksbank, acts for
+both the sending and the receiving participant, and for Swish payments the
+mandate is given to it by Swish on the participants' behalf (Anvisningar
+RIX-INST, section 14.2.2). The payment can be reconciled before it reaches
+RIX-INST, so no amount is reserved and no payment request goes to the
+receiving participant. In the pacs.008 for the standard and SIP models
+(Anvisningar RIX-INST, section 22.4, Table 64), `PmtTpInf/LclInstrm` is
+mandatory, `EndToEndId` and `UETR` are optional, and every field through
+`UltmtDbtr/Nm` except `TxId` (used for the duplicate check), the settlement amount's currency and
+the acceptance timestamp gets schema validation only. Everything railgate
+could use to classify a payment is therefore set on Swish's instruction and
+not checked by the Riksbank. The code values Swish puts in `LclInstrm` are
+not published there. `railgate.regulated.local-instrument-codes` must hold
+a code that only payouts carry: a code that every Swish payment carries
+would send private-to-private payments to verification, where they have no
+signature artefacts and are denied.
+
+**Refunds of Swish Handel payments are denied (not resolved).** A refund
+goes from the merchant, an organisation, to the payer, a private person, so
+the structural path classifies it as regulated. In the Swish API a refund
+is made with the merchant's TLS client certificate; the signing certificate
+is required only for the payout API (stated by the `getswish` client
+library's documentation, not checked against Getswish AB's own). A refund
+therefore has no signature artefacts at the payment-network operator, and
+railgate answers `DORA_32_AUDIT_MISSING`. Whether that happens in
+production depends on how refunds are coded in the pacs.008, which is not
+established. A refund label in the message would not resolve it: the label
+is set on Swish's instruction, so trusting it would move the bypass from
+omitting the instrument code to labelling a payout as a refund.
+
+What would resolve it is a reference to the original payment that railgate
+checks against the Riksbank's own settlement data. A settlement from
+organisation to private person would then be verified as a payout unless
+it references a payment settled in RIX-INST in the opposite direction
+between the same parties whose amount covers this and every earlier refund
+against it. Without the reference, it would be denied. A forged original
+would require a real settled transfer between the two banks' RIX-INST
+accounts. The RIX-INST rules do not require the reference (Table 64).
+DORA does: Getswish AB is a financial entity under DORA since its clearing
+authorisation (Finansinspektionen, 29 January 2026, dnr 24-30532), and
+Article 9(2) and 9(3)(c) require it to maintain the authenticity and
+integrity of data in transit and to prevent their impairment. A refund
+label that cannot be checked impairs the authenticity of the payout
+instruction it can stand in for. railgate can set the reference as a
+condition. It does not yet: `SettlementRequest` carries neither the amount
+nor the parties' identities nor a reference to an earlier payment, and
+railgate has no access to settled payments.
 
 ## Data minimisation
 
@@ -198,7 +248,11 @@ the rail delivers today.
 
 When verification cannot be completed, settlement is blocked. The
 originating bank receives a structured reason code. This is the complete
-set railgate can produce — no other value is reachable:
+set of reason codes railgate can produce — no other value is reachable.
+Responses that never reach the settlement logic carry no reason code: 401
+from Spring Security for a request without valid HTTP Basic credentials,
+and 413 (`{"error":"request_too_large"}`) from `RequestSizeLimitFilter` for
+an oversized body. A pipeline must treat both as a deny.
 
 | Reason code                | HTTP | allow | Meaning                                                            |
 |----------------------------|------|-------|--------------------------------------------------------------------|
@@ -209,14 +263,15 @@ set railgate can produce — no other value is reachable:
 | CERT_NOT_FOUND             | 403  | false | Certificate matches no gatekeeper audit entry — issuance was circumvented, or the wrong certificate was used. |
 | SIGNATURE_INVALID          | 403  | false | Cryptographic verification failed at the gatekeeper.                |
 | CERT_NON_COMPLIANT         | 403  | false | Certificate exists but was not issued through a compliant flow.     |
+| CERT_EXPIRED               | 403  | false | The signature verifies, but the certificate is outside its validity period (gatekeeper 1.6.0). |
 | MALFORMED_INPUT            | 403  | false | The gatekeeper could not parse the request. Not a signature failure. |
 | ALGORITHM_NOT_SUPPORTED    | 403  | false | The gatekeeper would not run the signature algorithm. Not a signature failure. |
 | NETWORK_ERROR              | 403  | false | gatekeeper unreachable, timed out, or returned an unusable body.    |
 | INVALID_SIGNATURE_MATERIAL | 403  | false | The artefacts from the payment-network operator are malformed or outside the wire contract above (digest not 128 hex characters, signature not base64 or over 4096 characters, certificate serial not hexadecimal or over 128 characters, issuer DN not an RFC 4514 name or over 512 characters, any of them blank). The gatekeeper was not called. |
-| INVALID_REQUEST            | 400  | false | The settlement request failed Bean Validation — a missing party-type flag, a blank transaction reference, an over-long instrument code. No verification was attempted. |
+| INVALID_REQUEST            | 400  | false | The settlement request failed Bean Validation — a missing party-type flag, a blank or over-36-character transaction reference, an over-long instrument code, declared certificate serial (128) or BIC (11). No verification was attempted. |
 | INTERNAL_ERROR             | 403  | false | Any unhandled failure inside railgate. Default-deny; no detail about the failure is returned to the caller. |
 
-`CERT_NOT_FOUND`, `CERT_NON_COMPLIANT`, `SIGNATURE_INVALID`,
+`CERT_NOT_FOUND`, `CERT_NON_COMPLIANT`, `CERT_EXPIRED`, `SIGNATURE_INVALID`,
 `MALFORMED_INPUT` and `ALGORITHM_NOT_SUPPORTED` are read from the
 gatekeeper's own `reason` field and passed through unchanged, as are
 `NETWORK_ERROR` and `INVALID_SIGNATURE_MATERIAL`, which railgate's client
@@ -236,10 +291,20 @@ valid data, the transaction does not settle.
 ## Build and run
 
 ```bash
-mvn -B clean verify                          # build + tests + OWASP scan
-mvn spring-boot:run                          # start on port 8082
-java -jar target/railgate-1.5.0.jar          # or run the built jar
+mvn -B clean verify                          # build + tests
+NVD_API_KEY=... mvn -B -Powasp verify -DnvdApiKeyEnvironmentVariable=NVD_API_KEY   # OWASP Dependency-Check scan
+mvn spring-boot:run -Dspring-boot.run.profiles=dev   # local run without TLS, port 8082
+java -jar target/railgate-1.6.0.jar          # deployed: needs server.ssl (see below)
 ```
+
+railgate does not start without TLS on its own listener
+(`ListenerTlsGuard`): configure `server.ssl.bundle` (or
+`server.ssl.key-store` / `server.ssl.certificate`). The `/api/v1/**`
+credentials and the settlement verdicts would otherwise travel in clear.
+The `dev` profile sets `railgate.server.allow-insecure-http=true` for a
+local run; never set it in a deployed configuration. Request bodies are
+capped at `railgate.limits.max-http-request-size` (default 16 KB,
+`RequestSizeLimitFilter`); a settlement request is well under 1 KB.
 
 Configuration via `application.yml`:
 
@@ -277,8 +342,10 @@ downgrade. Trust and key material come from one of two places:
 - **The JVM defaults** (`javax.net.ssl.trustStore`, `javax.net.ssl.keyStore`
   and their passwords), when `railgate.gatekeeper.ssl-bundle` is empty.
 
-A reverse proxy or service mesh terminating mTLS in front of railgate is an
-equally valid arrangement; in that case point `base-url` at the proxy.
+A reverse proxy or service mesh that terminates the mTLS to the gatekeeper
+on railgate's behalf (an egress proxy) is an equally valid arrangement; in
+that case point `base-url` at the proxy. This concerns the outbound link
+only: railgate's own listener must still have TLS (`ListenerTlsGuard`).
 
 **railgate does not verify signed gatekeeper responses.** The gatekeeper
 signs its receipts, and the verdict railgate consumes is not one of them:

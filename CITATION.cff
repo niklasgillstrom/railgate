@@ -24,11 +24,15 @@ abstract: >-
   (gatekeeper 1.4.0 required a certificate railgate never sends), aligns
   railgate with the four-field verification contract of gatekeeper 1.5.0,
   and stops reporting gatekeeper input errors to the originating bank as a
-  bad signature. Data-minimised by design: only digest, signature, and
+  bad signature. Version 1.6.0 refuses to start without TLS on its own
+  listener, bounds the request size, replaces every control character in
+  logged values, passes gatekeeper 1.6.0's CERT_EXPIRED through, documents
+  that refunds of Swish Handel payments are denied, and detects every PIT
+  mutant of its production code. Data-minimised by design: only digest, signature, and
   certificate identifiers traverse the supervisory chain — no transaction
   payload content is exposed to the supervisor.
-version: "1.5.0"
-date-released: "2026-09-30"
+version: "1.6.0"
+date-released: "2026-10-08"
 license: MIT
 repository-code: "https://github.com/niklasgillstrom/railgate"
 authors:

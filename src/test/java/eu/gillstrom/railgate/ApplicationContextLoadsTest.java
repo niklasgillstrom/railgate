@@ -35,7 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * not called.</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.MOCK)
-@TestPropertySource(properties = "railgate.gatekeeper.base-url=https://gatekeeper.test:8443")
+@TestPropertySource(locations = "classpath:tls-test.properties", properties = "railgate.gatekeeper.base-url=https://gatekeeper.test:8443")
 class ApplicationContextLoadsTest {
 
     @Autowired

@@ -26,8 +26,9 @@ import java.util.List;
  * {@code allow = false} blocks the settlement and returns the structured
  * reason code to the originating bank.
  *
- * <p>{@code GET /api/v1/audit} returns the full audit trail for inspection
- * by supervisory staff.
+ * <p>{@code GET /api/v1/audit} returns the retained audit trail (at most the
+ * newest 10 000 entries, {@code RailgateAuditLog.MAX_ENTRIES}) for inspection by supervisory
+ * staff.
  */
 @RestController
 @RequestMapping("/api/v1")
@@ -56,7 +57,8 @@ public class SettlementController {
     /**
      * Audit trail of railgate decisions, for supervisory inspection.
      *
-     * @return all recorded decisions in chronological order
+     * @return the retained decisions in chronological order; older ones are
+     *         evicted once the log is full (see {@link #auditHealth()})
      */
     @GetMapping("/audit")
     public ResponseEntity<List<RailgateAuditLog.AuditEntry>> audit() {

@@ -55,9 +55,10 @@ public class SettlementExceptionHandler {
         log.warn("Settlement request rejected by validation with {} error(s); "
                 + "no verification was attempted", ex.getBindingResult().getErrorCount());
         return deny(HttpStatus.BAD_REQUEST, "INVALID_REQUEST",
-                "Settlement request failed validation. The transaction reference and both "
-                + "party-type classification flags are required. No verification was "
-                + "attempted and the settlement is not permitted.");
+                "Settlement request failed validation. The transaction reference (at most 36 "
+                + "characters) and both party-type classification flags are required, and the "
+                + "declared certificate serial and the BICs must be within their lengths. No "
+                + "verification was attempted and the settlement is not permitted.");
     }
 
     @ExceptionHandler(Exception.class)

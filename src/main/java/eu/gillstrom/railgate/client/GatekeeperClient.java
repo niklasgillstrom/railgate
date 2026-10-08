@@ -11,9 +11,7 @@ import org.springframework.boot.ssl.SslBundle;
 import org.springframework.boot.ssl.SslBundles;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClientException;
@@ -209,9 +207,6 @@ public class GatekeeperClient {
 
         String url = gatekeeperBaseUrl + "/api/v1/verify";
 
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-
         Map<String, String> body = new HashMap<>();
         body.put("certSerial", signature.getCertSerial());
         body.put("issuerDn", signature.getIssuerDn());
@@ -222,7 +217,7 @@ public class GatekeeperClient {
             ResponseEntity<VerificationResult> response = restTemplate.exchange(
                     url,
                     HttpMethod.POST,
-                    new HttpEntity<>(body, headers),
+                    new HttpEntity<>(body), // Jackson writes application/json
                     VerificationResult.class
             );
 

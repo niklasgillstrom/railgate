@@ -29,7 +29,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * filter in front of them denies access.</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.MOCK)
-@TestPropertySource(properties = {
+@TestPropertySource(locations = "classpath:tls-test.properties", properties = {
         "railgate.gatekeeper.base-url=https://gatekeeper.test:8443"
 })
 class OpenApiExposureDefaultProfileTest {

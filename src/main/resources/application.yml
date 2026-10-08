@@ -1,5 +1,16 @@
 server:
   port: 8082
+  # railgate refuses to start without TLS on this listener (ListenerTlsGuard):
+  # configure server.ssl.bundle (or server.ssl.key-store / certificate), and
+  # for mTLS server.ssl.client-auth=need with a trust store. The dev profile
+  # overrides the guard for a local run.
+  # Headers only; the JSON body is bounded by railgate.limits below.
+  max-http-request-header-size: 8KB
+  tomcat:
+    # railgate accepts no form-encoded bodies.
+    max-http-form-post-size: 16KB
+    # How much of a rejected body Tomcat reads and discards before closing.
+    max-swallow-size: 64KB
 
 spring:
   application:
@@ -19,6 +30,16 @@ springdoc:
     path: /swagger-ui.html
 
 railgate:
+  limits:
+    # Maximum request body, enforced by RequestSizeLimitFilter. A settlement
+    # request is well under 1 KB.
+    max-http-request-size: 16KB
+
+  server:
+    # Escape hatch for a local development run without TLS on railgate's own
+    # listener. Never set it in a deployed configuration.
+    allow-insecure-http: false
+
   payment-network:
     # In production, replace with an HTTP-based client that calls Getswish AB's
     # signature-retrieval endpoint. The in-memory mode is for the reference
@@ -52,8 +73,9 @@ railgate:
 
   regulated:
     # Local-instrument codes that identify regulated payments subject to
-    # railgate enforcement. In the Swedish reference deployment, "SWISH"
-    # identifies Swish utbetalning.
+    # railgate enforcement. "SWISH" is a placeholder: the code must be one
+    # that only Swish utbetalning carries, and the values Swish uses are not
+    # published in Anvisningar RIX-INST.
     local-instrument-codes: SWISH
 
 logging:

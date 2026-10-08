@@ -97,4 +97,30 @@ class SettlementRequestValidationTest {
 
         assertThat(violatedProperties(request)).contains("localInstrumentCode");
     }
+
+    private static SettlementRequest.SettlementRequestBuilder valid() {
+        return SettlementRequest.builder()
+                .transactionReference("UETR-12345")
+                .debtorIsOrganization(true)
+                .creditorIsPrivatePerson(true);
+    }
+
+    @Test
+    void theTransactionReferenceIsBoundedByTheUetrLength() {
+        // EndToEndId is Max35Text and a UETR is a 36-character UUID; nothing
+        // longer is a pacs.008 reference, and an unbounded one is retained in
+        // the audit log and written to the operator log as received.
+        assertThat(validator.validate(valid().transactionReference("e".repeat(36)).build())).isEmpty();
+        assertThat(violatedProperties(valid().transactionReference("e".repeat(37)).build()))
+                .containsExactly("transactionReference");
+    }
+
+    @Test
+    void theDeclaredSerialAndTheBicsAreBounded() {
+        assertThat(validator.validate(valid().declaredCertSerial("a".repeat(PaymentSignature.MAX_CERT_SERIAL_LENGTH))
+                .debtorBic("ESSESESSXXX").creditorBic("HANDSESSXXX").build())).isEmpty();
+        assertThat(violatedProperties(valid().declaredCertSerial("a".repeat(PaymentSignature.MAX_CERT_SERIAL_LENGTH + 1))
+                .debtorBic("ESSESESSXXXX").creditorBic("HANDSESSXXXX").build()))
+                .containsExactlyInAnyOrder("declaredCertSerial", "debtorBic", "creditorBic");
+    }
 }

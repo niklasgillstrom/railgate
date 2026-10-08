@@ -13,7 +13,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Append-only audit record of railgate settlement decisions.
+ * In-memory audit record of railgate settlement decisions, appended to
+ * in order and bounded: beyond {@code MAX_ENTRIES} the oldest entry is
+ * evicted (with a WARN), so it is not a complete or tamper-evident log.
  *
  * <p>Records every {@link SettlementDecision} (allowed and denied) with
  * timestamp and reason code, supporting the supervisor's retrospective
@@ -25,8 +27,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Note: railgate's audit log is intentionally minimal. The
  * authoritative compliance record lives in gatekeeper. railgate only
  * records what railgate itself decided — not transaction payload content,
- * not signature material, not certificate detail. Just the binary decision
- * and the reason code, indexed by transaction reference.
+ * not signature material, not certificate detail. It keeps the decision,
+ * the reason code and message, and the gatekeeper's audit-entry id and
+ * hash, indexed by transaction reference, each field bounded in length.
  *
  * <p>This minimisation aligns with GDPR Art 5(1)(c) and avoids creating
  * an unnecessary secondary record of payment activity at the central-bank
@@ -79,16 +82,23 @@ public class RailgateAuditLog {
 
     /** Ceiling on the stored and logged decision message. */
     private static final int MAX_MESSAGE_LENGTH = 512;
+    /**
+     * Bound on the other text fields. The transaction reference is at most 36
+     * characters once validated, but the gatekeeper's audit entry id and hash
+     * arrive in its response and were retained, for up to
+     * {@code MAX_ENTRIES} entries, at whatever length it sent.
+     */
+    static final int MAX_FIELD_LENGTH = 128;
 
     private final Deque<AuditEntry> entries = new ConcurrentLinkedDeque<>();
     private final AtomicInteger entryCount = new AtomicInteger();
     private final AtomicLong evictedCount = new AtomicLong();
 
     public void record(SettlementDecision decision) {
-        String transactionReference = sanitise(decision.getTransactionReference(), Integer.MAX_VALUE);
+        String transactionReference = sanitise(decision.getTransactionReference(), MAX_FIELD_LENGTH);
         String message = sanitise(decision.getMessage(), MAX_MESSAGE_LENGTH);
-        String gatekeeperAuditEntryId = sanitise(decision.getAuditEntryId(), Integer.MAX_VALUE);
-        String gatekeeperAuditEntryHashHex = sanitise(decision.getAuditEntryHashHex(), Integer.MAX_VALUE);
+        String gatekeeperAuditEntryId = sanitise(decision.getAuditEntryId(), MAX_FIELD_LENGTH);
+        String gatekeeperAuditEntryHashHex = sanitise(decision.getAuditEntryHashHex(), MAX_FIELD_LENGTH);
 
         AuditEntry entry = new AuditEntry(
                 Instant.now(),
@@ -138,18 +148,19 @@ public class RailgateAuditLog {
     }
 
     /**
-     * Replaces CR and LF with a space and truncates to {@code maxLength}.
-     * Returns null unchanged so that an absent value stays absent rather than
-     * becoming an empty string.
+     * Replaces control characters (CR, LF, tab, escape, C1 controls such as
+     * NEL) and the Unicode line and paragraph separators with a space, and
+     * truncates to {@code maxLength}; {@link Integer#MAX_VALUE} means no
+     * truncation. Returns null unchanged so that an absent value stays absent
+     * rather than becoming an empty string.
      */
     public static String sanitise(String value, int maxLength) {
         if (value == null) {
             return null;
         }
-        String flattened = value.replace('\r', ' ').replace('\n', ' ');
-        if (maxLength != Integer.MAX_VALUE && flattened.length() > maxLength) {
-            return flattened.substring(0, maxLength);
-        }
-        return flattened;
+        StringBuilder out = new StringBuilder(value.length());
+        value.codePoints().forEach(c -> out.appendCodePoint(
+                Character.isISOControl(c) || c == 0x2028 || c == 0x2029 ? ' ' : c));
+        return out.substring(0, Math.min(out.length(), maxLength));
     }
 }

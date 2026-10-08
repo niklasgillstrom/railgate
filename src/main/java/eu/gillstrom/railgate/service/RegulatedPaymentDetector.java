@@ -20,9 +20,12 @@ import java.util.Set;
  *       whitespace, so {@code " swish "} is not a way past the check.</li>
  *
  *   <li><b>Structural derivation:</b> {@code OrgId} is populated on the
- *       debtor side and {@code PrvtId} on the creditor side. By definition
- *       of the Swish utbetalning service in Sweden, organization-to-private
- *       payouts via instant settlement are Swish utbetalning.</li>
+ *       debtor side and {@code PrvtId} on the creditor side. In Sweden,
+ *       organisation-to-private Swish payments are payouts (Swish
+ *       utbetalning) and refunds of Swish Handel payments. This path
+ *       cannot tell the two apart, so a refund is verified as a payout and,
+ *       having no payout signature, denied. See README, "Refunds of Swish
+ *       Handel payments are denied".</li>
  * </ol>
  *
  * <p>Either path is sufficient. A bank that omits the explicit code does

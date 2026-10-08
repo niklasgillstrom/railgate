@@ -16,7 +16,7 @@ The three components together operationalise the data-minimised quadruple-triang
 
 - A **reference implementation** of settlement-rail enforcement as described in Article 1 §4.3 and §6.2 and in Article 2 §6.1 and §9.3. Railgate sits at the central-bank settlement rail and performs deterministic cryptographic signature verification at settlement time, blocking any settlement that cannot be matched to a compliant gatekeeper audit entry.
 - A **demonstration** of the data-minimisation contract: the supervisor never sees transaction payload content, only the SHA-512 digest, the signature, and the certificate identifiers. SHA-512 collision resistance binds the signature to the payload the digest was taken over — not, by itself, to the pacs.008 message being settled; see the note on the residual binding assumption in `README.md`.
-- A **default-deny enforcement** prototype with structured reason codes returned to the originating bank. The complete set is `ALLOWED`, `NOT_REGULATED`, `DORA_32_AUDIT_MISSING`, `DECLARED_CERT_MISMATCH`, `CERT_NOT_FOUND`, `SIGNATURE_INVALID`, `CERT_NON_COMPLIANT`, `MALFORMED_INPUT`, `ALGORITHM_NOT_SUPPORTED`, `NETWORK_ERROR`, `INVALID_SIGNATURE_MATERIAL`, `INVALID_REQUEST`, `INTERNAL_ERROR`; `README.md` tabulates each with its HTTP status. No other value is reachable.
+- A **default-deny enforcement** prototype with structured reason codes returned to the originating bank. The complete set is `ALLOWED`, `NOT_REGULATED`, `DORA_32_AUDIT_MISSING`, `DECLARED_CERT_MISMATCH`, `CERT_NOT_FOUND`, `SIGNATURE_INVALID`, `CERT_NON_COMPLIANT`, `CERT_EXPIRED`, `MALFORMED_INPUT`, `ALGORITHM_NOT_SUPPORTED`, `NETWORK_ERROR`, `INVALID_SIGNATURE_MATERIAL`, `INVALID_REQUEST`, `INTERNAL_ERROR`; `README.md` tabulates each with its HTTP status. No other value is reachable.
 
 **Isn't:**
 
@@ -85,13 +85,13 @@ mvn -B clean verify
 Expected output:
 
 ```
-[INFO] Tests run: 62, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 93, Failures: 0, Errors: 0, Skipped: 0
 [INFO] BUILD SUCCESS
 ```
 
-The 62 tests are distributed as follows.
+The 93 tests are distributed as follows.
 
-`SettlementOrchestratorTest` (19):
+`SettlementOrchestratorTest` (25):
 
 1. `allowsSettlementWhenSignatureVerifiesAndCertCompliant` — happy path; gatekeeper returns `signatureValid=true, compliant=true`.
 2. `deniesWhenSignatureMissingFromPaymentNetwork` — payment-network operator has no record → `DORA_32_AUDIT_MISSING`.
@@ -112,14 +112,26 @@ The 62 tests are distributed as follows.
 17. `declaredCertSerialThatIsNotHexadecimalIsDenied` — an unparseable declared serial is a mismatch.
 18. `declaredCertSerialNumericallyEqualToTheOperatorSerialIsNotAMismatch` — `" 0X0012345 "` equals `12345`; settlement proceeds.
 19. `gatekeeperSettlementAuditEntryHashIsCarriedIntoTheDecisionAndTheAuditLog` — the gatekeeper's `auditEntryHashHex` reaches the decision and `RailgateAuditLog` on an allow and on a `CERT_NOT_FOUND` deny, where the registry `auditEntryId` is `null`.
+20. `anExpiredCertificateIsReportedAsCertExpired` — gatekeeper's `CERT_EXPIRED` (signature valid, certificate outside its validity period) passes through.
+21. `aSettlementWithoutInstrumentCodeThatIsNotOrganisationToPrivatePassesThrough` — no instrument code and a classification other than organisation-to-private → `NOT_REGULATED`.
+22. `aDenialWithoutAReasonIsReportedAsSignatureInvalidWithTheDefaultMessage` — a gatekeeper deny without a reason becomes `SIGNATURE_INVALID` with the fixed message.
+23. `anOperatorSerialThatIsNotHexadecimalIsLeftToTheMaterialCheck` — an unparseable operator serial is not a `DECLARED_CERT_MISMATCH`; the gatekeeper client's material check answers.
+24. `aBlankInstrumentCodeIsNotARegulatedCode` — `"   "` does not match a configured code.
+25. `theDetectorTreatsAnAbsentRequestAsRegulated` — `RegulatedPaymentDetector.isRegulated(null)` is true.
 
-`GatekeeperClientTest` (24): the five transport tests from 1.3.0 (data-minimisation contract, server error, empty body, unparseable body, foreign JSON), three start-up tests for the `https://` requirement and its override, and four for the cryptographic-material checks (short digest, non-hex digest, non-base64 signature, blank certificate serial or issuer DN) — each asserting that no call to the gatekeeper is made. Added in 1.5.0: the contract test against gatekeeper's `SignatureVerificationRequest` (`requestBodyMatchesTheGatekeeperSignatureVerificationRequest`), values at and beyond the gatekeeper's `@Size` limits, a non-hexadecimal certificate serial, an issuer DN that is not an RFC 4514 name, a transport error whose message carries CR/LF, and five tests for the SSL bundle (none configured, blank name, bundle applied to the connection, unknown bundle, bundle with cipher or protocol options). Added after the 1.5.0 review: `readsTheSettlementAuditEntryHashFromTheGatekeeperResponse`, the gatekeeper's `auditEntryHashHex` deserialised next to `auditEntryId`.
+`GatekeeperClientTest` (26): the five transport tests from 1.3.0 (data-minimisation contract, server error, empty body, unparseable body, foreign JSON), three start-up tests for the `https://` requirement and its override, and four for the cryptographic-material checks (short digest, non-hex digest, non-base64 signature, blank certificate serial or issuer DN) — each asserting that no call to the gatekeeper is made. Added in 1.5.0: the contract test against gatekeeper's `SignatureVerificationRequest` (`requestBodyMatchesTheGatekeeperSignatureVerificationRequest`), values at and beyond the gatekeeper's `@Size` limits, a non-hexadecimal certificate serial, an issuer DN that is not an RFC 4514 name, a transport error whose message carries CR/LF, and five tests for the SSL bundle (none configured, blank name, bundle applied to the connection, unknown bundle, bundle with cipher or protocol options). Added after the 1.5.0 review: `readsTheSettlementAuditEntryHashFromTheGatekeeperResponse`, the gatekeeper's `auditEntryHashHex` deserialised next to `auditEntryId`. Added in 1.6.0: the configured connect and read timeouts bound the gatekeeper connection, and each malformed artefact is logged by the field it concerns and never with its value.
 
 `FilePaymentNetworkClientTest` (4): artefacts are found by transaction reference, entries written after start-up are visible, unknown references and malformed lines yield nothing, and file mode without a file is refused at start-up.
 
-`RailgateAuditLogTest` (1): a gatekeeper audit-entry identifier carrying CR/LF is flattened before it is stored or logged.
+`RailgateAuditLogTest` (5): a gatekeeper audit-entry identifier carrying CR/LF is flattened before it is stored or logged; fields from the gatekeeper are bounded and carry no control characters; the sanitiser keeps ordinary text and honours the limit; the log keeps the newest 10 000 entries, counts the discarded ones and warns once per thousand; an allow is logged at INFO and a denial at WARN.
 
-`SettlementRequestValidationTest` (4): a payload carrying only `transactionReference` is rejected on both party-type flags; a fully classified request validates; a blank reference and an over-35-character instrument code are rejected.
+`SettlementControllerTest` (3): an allow is answered 200 and a denial 403 with the orchestrator's decision as body; the audit endpoints return the log and its health.
+
+`RequestSizeLimitFilterTest` (6): a declared length above the cap is a 413 with the JSON error body before the body is read; a length at the cap and an empty body pass unwrapped; an undeclared length is counted while read; the counting stream forwards `available`, `isFinished`, `isReady`, `setReadListener` and `close` to the stream it wraps; a non-positive cap is refused.
+
+`ListenerTlsGuardTest` (6) and `ListenerTlsStartUpTest` (2): railgate does not start without TLS key material (switched-off SSL, missing material and a blank bundle included) unless the development override is set; with a certificate the listener speaks TLS, requires Basic authentication under `/api/v1` and outside it, and answers an oversized authenticated request with 413.
+
+`SettlementRequestValidationTest` (6): a payload carrying only `transactionReference` is rejected on both party-type flags; a fully classified request validates; a blank reference and an over-35-character instrument code are rejected; the transaction reference is bounded at 36 characters, the declared certificate serial at 128 and the BICs at 11.
 
 `SettlementExceptionHandlerTest` (4): an unexpected exception becomes a 403 deny; the response carries nothing from the exception; a validation failure becomes a 400 deny; both are audited.
 
@@ -127,7 +139,9 @@ The 62 tests are distributed as follows.
 
 `OpenApiExposureDefaultProfileTest` (2) and `OpenApiExposureDevProfileTest` (2): `/v3/api-docs` and `/swagger-ui.html` are 404 under the shipped configuration and served only with the `dev` profile.
 
-OWASP Dependency-Check runs as part of `verify` and passes without suppressions (`.owasp-suppressions.xml` is empty). The plugin stays at 12.2.2: 13.0.0 cannot update its NVD data without an NVD API key (dependency-check/DependencyCheck#8715, fixed for the unreleased 13.0.1). The earlier DOMPurify finding inside swagger-ui was resolved by pinning `org.webjars:swagger-ui` (5.32.15 since 1.5.0); Tomcat is overridden to 11.0.26 for the same reason (see `CHANGELOG.md`, Dependencies). Swagger UI itself is served only under the `dev` profile.
+**Mutation testing.** `mvn -Ppit test-compile org.pitest:pitest-maven:mutationCoverage` runs PIT 1.30.0 with the JUnit 5 plugin over every production class (reports in `target/pit-reports/`). In 1.6.0 every one of the 185 mutants is killed, and the profile fails below 100 % (`mutationThreshold`). Three mutants of the first run could not be killed because the mutated code behaved identically; the constructs behind them were redundant and are gone: an explicit `Content-Type` that Jackson's converter sets anyway (still asserted by `forwardsExactlyTheFourDataMinimisedFields`), a truncation guard whose boundary returned the same string (`sanitise` now takes `substring(0, min(length, max))`), and an early return for a zero-byte read in the counting stream.
+
+OWASP Dependency-Check runs with the `owasp` profile (`mvn -B -Powasp verify`; not in the default build since 1.6.0) and passes without suppressions (`.owasp-suppressions.xml` is empty). The plugin stays at 12.2.2: 13.0.0 cannot update its NVD data without an NVD API key (dependency-check/DependencyCheck#8715, fixed for the unreleased 13.0.1). The earlier DOMPurify finding inside swagger-ui was resolved by pinning `org.webjars:swagger-ui` (5.32.15 since 1.5.0); Tomcat is overridden to 11.0.26 for the same reason (see `CHANGELOG.md`, Dependencies). Swagger UI itself is served only under the `dev` profile.
 
 ---
 
@@ -137,7 +151,7 @@ The following assertions are reproducible by running `mvn -B test`:
 
 - The orchestrator's data-minimisation contract holds for the JSON wire format. (Test 1 + 4 — neither request nor response contains a transaction payload field.)
 - Default-deny returns the correct structured reason code for each failure mode. (Tests 2, 3, 4.)
-- Structural derivation identifies regulated payments without bank-supplied metadata. (Test 5.)
+- Structural derivation identifies regulated payments from the two party-type flags, which are metadata the settlement system derives and supplies (see `README.md`, "What regulated-payment detection rests on"). (Test 5.)
 - Non-regulated settlements are passed through without verification. (Test 6.)
 
 ---
@@ -165,6 +179,10 @@ The reference implementation registers signature artefacts in an in-memory map. 
 ### `SettlementRequest` is an abstraction, not a pacs.008 parser (High for production)
 
 The reference accepts a Java DTO with the seven fields railgate actually needs: `transactionReference`, `localInstrumentCode`, `declaredCertSerial`, `debtorIsOrganization`, `creditorIsPrivatePerson`, `debtorBic`, `creditorBic`. A production integration with RIX-INST would receive the full pacs.008 message via SWIFT or the central-bank API and parse the relevant fields (`PmtTpInf/LclInstrm`, `Dbtr/Id`, `Cdtr/Id`, `RmtInf` etc.) before calling the orchestrator. Because railgate consumes the parsed result rather than the message, the two party-type flags are that pipeline's output and not something railgate can check.
+
+### Refunds of Swish Handel payments are denied (High for production)
+
+A refund of a Swish Handel payment goes from organisation to private person, so the structural path classifies it as regulated; it carries no payout signature, so railgate answers `DORA_32_AUDIT_MISSING`. `SettlementRequest` cannot tell a refund from a payout, and a refund label set on Swish's instruction would not be a control. The resolution, a reference to the original payment checked against settled RIX-INST payments and required under DORA Article 9(2) and 9(3)(c), is described in `README.md` ("Refunds of Swish Handel payments are denied") and not implemented.
 
 ### Regulatory deployment integration is the central-bank's responsibility (Inherent)
 

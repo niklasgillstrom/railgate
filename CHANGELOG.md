@@ -2,6 +2,37 @@
 
 This file starts at 1.4.0. Earlier releases are documented in the git history, in `PEER_REVIEW_GUIDE.md` and in `CROSS_REFERENCE.md`.
 
+## 1.6.0 (2026-10-08)
+
+### Security
+
+- **No TLS on railgate's own listener.** `/api/v1/**` is authenticated with HTTP Basic, and the shipped configuration listened on plain HTTP, so the credentials and the settlement verdicts travelled in clear. `ListenerTlsGuard` now refuses to start without `server.ssl` key material (a bundle, a key store or a certificate); `railgate.server.allow-insecure-http=true`, set by the `dev` profile, overrides it for a local run and logs a WARN. Tests: `ListenerTlsGuardTest` (6) and `ListenerTlsStartUpTest`, which starts the shipped configuration on a random port: without TLS it fails, with the test certificate the handshake completes.
+- **Unbounded request size.** The JSON body had no limit (Spring Boot bounds headers, multipart and form bodies only), the transaction reference had none, and the declared certificate serial and the BICs had none; the audit log retained the transaction reference and the gatekeeper's audit entry id and hash at whatever length they arrived, for up to 10 000 entries. `THREAT_MODEL.md` nevertheless called per-request resource consumption bounded. Now `RequestSizeLimitFilter` (gatekeeper's) caps bodies at `railgate.limits.max-http-request-size` (16 KB), the transaction reference is at most 36 characters (EndToEndId `Max35Text`, UETR 36), the declared serial 128 and the BICs 11, and the audit log keeps at most 128 characters per field (512 for the message). Tests: `RequestSizeLimitFilterTest` (4), an oversized authenticated request answered 413 in `ListenerTlsStartUpTest`, `SettlementRequestValidationTest`, `RailgateAuditLogTest`.
+- **Log sanitising covered CR and LF only.** Other control characters (escape sequences, tab, C1 controls such as NEL) and the Unicode line and paragraph separators reached the operator log and the audit snapshot. All are now replaced with a space.
+
+- **Build:** Jackson 3.1.7 and 2.21.7 instead of the 3.1.5 and 2.21.5 that
+  Spring Boot 4.1.1 manages (CVE-2026-83557, listed as fixed in 3.1.6 and
+  2.21.6); `project.build.outputTimestamp`, so the same commit builds to a
+  byte-identical jar (two builds of railgate compared: different hashes
+  without it, identical with it); and the OWASP Dependency-Check scan moved
+  to the `owasp` profile (`mvn -Powasp verify`), so a build without
+  network access or NVD key can run the tests.
+
+### Gatekeeper 1.6.0
+
+- **`CERT_EXPIRED` is passed through.** gatekeeper 1.6.0 answers `CERT_EXPIRED`, with `signatureValid=true`, for a certificate outside its validity period. railgate did not know the code and reported `CERT_NON_COMPLIANT`; the settlement was denied either way. Test: `SettlementOrchestratorTest.anExpiredCertificateIsReportedAsCertExpired`.
+
+### Documentation
+
+- **Refunds of Swish Handel payments are denied.** A refund goes from organisation to private person, so the structural path classifies it as regulated, and it carries no payout signature, so railgate answers `DORA_32_AUDIT_MISSING`. `README.md` now says so, says who writes the pacs.008 (the SIP model's Instructing Party on Swish's mandate, Anvisningar RIX-INST 14.2.2), which pacs.008 fields RIX-INST checks (Table 64), and what would resolve it: a reference to the original payment, checked against settled RIX-INST payments and required by DORA Article 9(2) and 9(3)(c). Not implemented. The javadoc of `RegulatedPaymentDetector` and `SettlementRequest` said organisation-to-private is Swish utbetalning "by definition"; it is utbetalning or a refund. `application.yml` called "SWISH" the code that identifies Swish utbetalning; it is a placeholder, and the configured code must be one only payouts carry.
+- `pom.xml` cited `10.5281/zenodo.19930311` and `…396` for hsm and gatekeeper, where every `CITATION.cff` and `README.md` in the three repositories names the concept DOIs `…310` and `…395`. It now does too.
+
+All 24 guard mutants of these changes are killed.
+
+### Tests
+
+- **Mutation testing.** A `pit` profile (`mvn -Ppit test-compile org.pitest:pitest-maven:mutationCoverage`, PIT 1.30.0) runs over every production class and fails below 100 %. First run 147 of 192 killed; now 185 of 185. New tests cover the audit-log cap and log levels, the material-problem log lines (field named, value withheld), the controller's 200/403, a reasonless gatekeeper deny, an unparseable operator serial, a blank instrument code, the 413 body, the counting stream's delegation and Basic authentication outside `/api/v1`. Three redundant constructs whose mutants no test could kill were removed (see `PEER_REVIEW_GUIDE.md`, Mutation testing). 93 tests.
+
 ## 1.5.0
 
 **railgate 1.5.0 requires gatekeeper 1.5.0 or later.** Against gatekeeper 1.4.0 it denies every regulated settlement, exactly as railgate 1.4.0 did.

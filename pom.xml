@@ -13,15 +13,15 @@
 
     <groupId>eu.gillstrom</groupId>
     <artifactId>railgate</artifactId>
-    <version>1.5.0</version>
+    <version>1.6.0</version>
     <name>DORA Settlement-Layer Attestation Gate</name>
     <description>
         Settlement-rail enforcement component for DORA-compliant payment
         infrastructure. Sits at the central-bank settlement layer (RIX-INST,
         TIPS, FedNow or equivalent) and performs deterministic cryptographic
         signature verification at settlement time. Companion artefact to the
-        hsm reference (https://doi.org/10.5281/zenodo.19930311) and the
-        gatekeeper reference (https://doi.org/10.5281/zenodo.19930396).
+        hsm reference (https://doi.org/10.5281/zenodo.19930310) and the
+        gatekeeper reference (https://doi.org/10.5281/zenodo.19930395).
 
         Scope:
           For each settlement request identified as a regulated payment
@@ -36,7 +36,7 @@
 
             (2) cryptographic verification at the supervisor's gatekeeper
                 instance via POST /api/v1/verify, returning a binary
-                {signature_valid, compliant} decision derived from the
+                {signatureValid, compliant} decision derived from the
                 stored certificate and audit-log entry;
 
             (3) default-deny enforcement: settlements without a valid
@@ -47,8 +47,10 @@
         Data minimisation:
           railgate never sees, transports, or stores transaction payload
           content (amounts, sender/receiver detail, business message). It
-          handles only cryptographic artefacts (digest, signature, cert
-          serial) and a binary verification outcome. This satisfies GDPR
+          handles cryptographic artefacts (digest, signature, cert serial,
+          issuer DN), the binary verification outcome, and the settlement
+          metadata listed in README.md (transaction reference, declared
+          certificate serial, BICs, party-type flags, instrument code). This satisfies GDPR
           Art 5(1)(c) and the proportionality requirement implicit in
           DORA Art 32 supervisory data processing.
 
@@ -108,6 +110,18 @@
              Tomcat 11.0.26 fixes CVE-2026-73581/75973/76183/77756/77762/77791/78383/78437/
              79677/86248/86350/87022. Remove this override when the parent manages >= 11.0.26. -->
         <tomcat.version>11.0.26</tomcat.version>
+        <!-- Spring Boot 4.1.1 manages Jackson 3.1.5 and 2.21.5. CVE-2026-83557
+             (deserialization of untrusted data) is listed as fixed in 3.1.6 and
+             2.21.6; 3.1.7 and 2.21.7 are the latest patch releases of those lines
+             (Maven Central, 2026-10-06). Remove when the parent manages them. -->
+        <jackson-bom.version>3.1.7</jackson-bom.version>
+        <jackson-2-bom.version>2.21.7</jackson-2-bom.version>
+        <!-- Spring Boot 4.1.1 manages 1.18.46; the annotation processor below is 1.18.48. -->
+        <lombok.version>1.18.48</lombok.version>
+        <!-- Reproducible builds: entries in the jar carry this time instead of
+             the build time, so the same commit builds to the same bytes. Set
+             it to the release date when cutting a release. -->
+        <project.build.outputTimestamp>2026-10-06T00:00:00Z</project.build.outputTimestamp>
     </properties>
 
     <dependencies>
@@ -136,7 +150,7 @@
         <dependency>
             <groupId>org.webjars</groupId>
             <artifactId>swagger-ui</artifactId>
-            <version>5.32.15</version>
+            <version>5.33.1</version>
         </dependency>
 
         <!-- Lombok -->
@@ -203,28 +217,83 @@
                 </executions>
             </plugin>
 
-            <plugin>
-                <groupId>org.owasp</groupId>
-                <artifactId>dependency-check-maven</artifactId>
-                <version>12.2.2</version>
-                <configuration>
-                    <failBuildOnCVSS>7</failBuildOnCVSS>
-                    <formats>
-                        <format>HTML</format>
-                        <format>JSON</format>
-                    </formats>
-                    <suppressionFiles>
-                        <suppressionFile>${project.basedir}/.owasp-suppressions.xml</suppressionFile>
-                    </suppressionFiles>
-                </configuration>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>check</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+            OWASP Dependency-Check runs only with -Powasp (mvn -Powasp verify).
+            In the default build it downloaded the whole NVD database on every
+            clean machine, which is slow, needs network access and failed any
+            offline or sandboxed build, including one that only runs the tests.
+        -->
+        <profile>
+            <id>owasp</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.owasp</groupId>
+                        <artifactId>dependency-check-maven</artifactId>
+                        <version>12.2.2</version>
+                        <configuration>
+                            <failBuildOnCVSS>7</failBuildOnCVSS>
+                            <formats>
+                                <format>HTML</format>
+                                <format>JSON</format>
+                            </formats>
+                            <suppressionFiles>
+                                <suppressionFile>${project.basedir}/.owasp-suppressions.xml</suppressionFile>
+                            </suppressionFiles>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <!--
+                Mutation testing with PIT: mvn -Ppit test-compile org.pitest:pitest-maven:mutationCoverage
+                Reports are written to target/pit-reports/.
+            -->
+            <id>pit</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.pitest</groupId>
+                        <artifactId>pitest-maven</artifactId>
+                        <version>1.30.0</version>
+                        <dependencies>
+                            <dependency>
+                                <groupId>org.pitest</groupId>
+                                <artifactId>pitest-junit5-plugin</artifactId>
+                                <version>1.2.3</version>
+                            </dependency>
+                        </dependencies>
+                        <configuration>
+                            <targetClasses>
+                                <param>eu.gillstrom.railgate.*</param>
+                            </targetClasses>
+                            <targetTests>
+                                <param>eu.gillstrom.railgate.*</param>
+                            </targetTests>
+                            <threads>4</threads>
+                            <!-- Every mutant is killed in 1.6.0 (PEER_REVIEW_GUIDE.md). -->
+                            <mutationThreshold>100</mutationThreshold>
+                            <timestampedReports>false</timestampedReports>
+                            <outputFormats>
+                                <param>HTML</param>
+                                <param>CSV</param>
+                            </outputFormats>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

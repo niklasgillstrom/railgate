@@ -53,8 +53,8 @@ public class PaymentSignature {
      * Hex-encoded SHA-512 digest of the original signed transaction payload.
      * Computed by the originating signer (customer's HSM-bound key) and
      * stored by the payment-network operator. Never recomputed from a
-     * payload at this layer — the digest is the only data railgate ever
-     * sees.
+     * payload at this layer: railgate never sees the payload, only this
+     * digest and the other artefacts and metadata listed in README.md.
      */
     @NotBlank
     private String digestHex;
