@@ -1,12 +1,19 @@
 ## Developer profile — activate with: --spring.profiles.active=dev
 ##
-## This profile turns the OpenAPI document and Swagger UI back on, and lets
-## railgate start without TLS on its own listener. Every other profile leaves
-## both off (see application.yml). Do not deploy with this profile active.
+## This profile turns the OpenAPI document and Swagger UI back on, lets
+## railgate start without TLS on its own listener, and accepts unsigned
+## gatekeeper verdicts. Every other profile leaves all three off (see
+## application.yml). Do not deploy with this profile active.
 
 railgate:
   server:
     allow-insecure-http: true
+  gatekeeper:
+    # Accept gatekeeper verdicts without a verified signature, recorded as
+    # UNSIGNED (no signature fields) or UNVERIFIED (signature fields present but
+    # no railgate.gatekeeper.trusted-keys configured to check them with). If
+    # trusted-keys is configured, a signed verdict is still verified.
+    require-signed-verdict: false
 
 springdoc:
   api-docs:

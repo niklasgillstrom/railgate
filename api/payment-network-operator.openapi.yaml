@@ -1,0 +1,262 @@
+openapi: 3.0.3
+info:
+  title: Payment-network operator — payout artefact retrieval
+  version: "1.0.0"
+  description: |
+    Interface that a payment-network operator (Getswish AB in the Swedish
+    reference deployment) would offer so that a settlement-rail enforcement
+    component such as railgate can retrieve, for one settlement, the signature
+    artefacts the originating bank submitted with the payout instruction.
+
+    No operator offers this interface today. It is specified here so that it
+    can be required of one, for example through participation conditions.
+    railgate implements the client side (`HttpPaymentNetworkClient`,
+    `railgate.payment-network.mode=http`).
+
+    ## Transport and authentication
+
+    Mutual TLS is required. The operator authenticates the caller by its TLS
+    client certificate and must refuse the handshake, or answer 401/403,
+    without one it accepts; the caller authenticates the operator by its
+    server certificate. OpenAPI 3.0 has no security-scheme type for mutual TLS
+    (`mutualTLS` was added in OpenAPI 3.1), so the requirement is stated here
+    and marked with `x-mutual-tls-required` on the operation instead of in
+    `securitySchemes`.
+
+    ## Operator signature (canonical form `op1`)
+
+    Every 200 response carries the operator's signature over its content, so
+    that the answer can be checked independently of the TLS session that
+    delivered it. The signature (`operatorSignatureBase64`, standard base64)
+    is computed with the JCA algorithm named in `operatorSignatureAlgorithm`
+    over the UTF-8 bytes of:
+
+        "op1|" + transactionReference + "|" + payoutInstructionId + "|" + certSerialHex
+               + "|" + issuerDn + "|" + digestHex + "|" + signatureBase64 + "|" + issuedAt
+
+    where the fields are the response properties of the same name, and
+
+    * `certSerialHex` = `new BigInteger(certSerial without an optional "0x" prefix, 16).toString(16)`
+      (lowercase, no leading zeros). railgate also strips an uppercase `0X`
+      prefix and refuses a serial that is not plain hexadecimal (a sign,
+      whitespace or any other character).
+    * `issuerDn` = `new X500Principal(issuerDn).getName(X500Principal.RFC2253)`.
+    * `digestHex` is lowercased.
+    * in every one of the seven string fields — after the normalisation
+      above — `%` is replaced by `%25` first, and then `|` by `%7C`. Nothing
+      else is escaped.
+    * `transactionReference`, `payoutInstructionId`, `signatureBase64` and
+      `issuedAt` are used exactly as they appear in the response; the
+      verifier does not re-format them.
+
+    `operatorKeyFingerprintHex` is the lowercase hexadecimal SHA-256 of the
+    DER encoding of the SubjectPublicKeyInfo of the operator's signing
+    certificate (64 characters, no separators) — not of the certificate
+    itself. It is the convention the gatekeeper uses for its own signing keys
+    (`publicKeyFingerprintHex` on `GET /v1/gatekeeper/keys`), so a relying
+    party computes one fingerprint per key everywhere. It selects the
+    certificate the verifier checks the signature with; it is not itself
+    evidence of anything.
+
+    Example (the strings are Java literals):
+
+        transactionReference = "E2E|ID%01"
+        payoutInstructionId  = "E4D773858AF5459B96ABCA4B9DBFF94D"
+        certSerial           = "0x00C0FFEE"
+        issuerDn             = "CN=Example CA, O=Example Bank, C=SE"
+        digestHex            = "AB" repeated 64 times
+        signatureBase64      = "c2lnbmF0dXJl"
+        issuedAt             = "2026-10-30T12:00:00Z"
+
+    gives the canonical string
+
+        "op1|E2E%7CID%2501|E4D773858AF5459B96ABCA4B9DBFF94D|c0ffee|CN=Example CA,O=Example Bank,C=SE|"
+          + "ab" repeated 64 times + "|c2lnbmF0dXJl|2026-10-30T12:00:00Z"
+
+    (254 bytes in UTF-8; SHA-256 of those bytes
+    4a6ac4f4b5f085aaa27d79539d073cece820ae854d17bcb85b77133f545b038d).
+
+    ## What railgate accepts
+
+    railgate uses a 200 response only if all of the following hold, and
+    otherwise denies the settlement with `OPERATOR_SIGNATURE_INVALID` without
+    calling the gatekeeper:
+
+    1. the body is at most 65 536 bytes of JSON, a single object without
+       duplicate keys, in which all ten `PayoutArtefacts` properties are JSON
+       strings;
+    2. `transactionReference` equals the requested reference exactly;
+    3. `payoutInstructionId` matches the schema pattern below, `certSerial` is
+       hexadecimal and `issuerDn` parses as a distinguished name;
+    4. `operatorKeyFingerprintHex` equals the fingerprint of a certificate
+       railgate has been configured to trust
+       (`railgate.payment-network.trusted-keys`);
+    5. `operatorSignatureAlgorithm` is one of the values listed in the schema
+       (exact, case-sensitive);
+    6. the signature verifies under that certificate's public key over the
+       `op1` bytes.
+
+    A 404 is read as "the operator holds no artefacts for this reference".
+    Any other status, a redirect, a timeout or a transport failure is read as
+    "the operator is unavailable". Additional properties in the 200 body are
+    ignored; they are not covered by the signature and railgate does not use
+    them.
+
+    ## Scope of the signature
+
+    The signature makes the operator accountable for the answer it gave. It
+    does not show that the artefacts are the ones the originating bank
+    submitted, nor that the operator holds no other artefacts for the same
+    reference.
+servers:
+  - url: https://payment-network-operator.example
+    description: Placeholder. The path below is relative to the operator's base URL (railgate.payment-network.base-url).
+paths:
+  /v1/payout-artefacts/{transactionReference}:
+    get:
+      operationId: getPayoutArtefacts
+      summary: Signature artefacts of the payout instruction behind one settlement
+      x-mutual-tls-required: true
+      description: |
+        Returns the artefacts the originating bank submitted with the payout
+        instruction identified by the settlement's transaction reference,
+        signed by the operator (canonical form `op1`, see the API description).
+        mTLS is required.
+      parameters:
+        - name: transactionReference
+          in: path
+          required: true
+          description: |
+            The settlement's end-to-end reference: a UETR (36-character UUID)
+            or a pacs.008 EndToEndId (ISO 20022 Max35Text). railgate
+            percent-encodes every octet of its UTF-8 encoding except the RFC 3986
+            unreserved characters (`A-Z a-z 0-9 - . _ ~`), as `%XX` with
+            uppercase hex, so `/`, `|`, `%`, `;`, `+` and a space arrive as
+            `%2F`, `%7C`, `%25`, `%3B`, `%2B` and `%20`. The operator decodes
+            it before the lookup and echoes the decoded value in the response.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 36
+      responses:
+        "200":
+          description: Artefacts found. The body is signed by the operator (`op1`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayoutArtefacts"
+              example:
+                transactionReference: "E2E|ID%01"
+                payoutInstructionId: "E4D773858AF5459B96ABCA4B9DBFF94D"
+                certSerial: "0x00C0FFEE"
+                issuerDn: "CN=Example CA, O=Example Bank, C=SE"
+                digestHex: "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+                signatureBase64: "c2lnbmF0dXJl"
+                issuedAt: "2026-10-30T12:00:00Z"
+                operatorSignatureBase64: "(illustrative; base64 signature over the op1 bytes)"
+                operatorSignatureAlgorithm: "SHA256withRSA"
+                operatorKeyFingerprintHex: "0000000000000000000000000000000000000000000000000000000000000000"
+        "404":
+          description: |
+            The operator holds no artefacts for this reference. railgate denies
+            the settlement with `DORA_32_AUDIT_MISSING`. The body, if any, is
+            not read.
+        default:
+          description: |
+            Any other status. railgate treats it as the operator being
+            unavailable and denies the settlement with `NETWORK_ERROR`.
+components:
+  schemas:
+    PayoutArtefacts:
+      type: object
+      description: |
+        All ten properties are required and are JSON strings. Every property
+        except the last three is covered by the operator signature.
+      required:
+        - transactionReference
+        - payoutInstructionId
+        - certSerial
+        - issuerDn
+        - digestHex
+        - signatureBase64
+        - issuedAt
+        - operatorSignatureBase64
+        - operatorSignatureAlgorithm
+        - operatorKeyFingerprintHex
+      properties:
+        transactionReference:
+          type: string
+          minLength: 1
+          maxLength: 36
+          description: |
+            The reference that was requested (UETR or EndToEndId), decoded,
+            character for character. A response for any other reference is
+            rejected.
+        payoutInstructionId:
+          type: string
+          pattern: "^[!-~]{1,64}$"
+          description: |
+            The operator's own identifier of the payout instruction the
+            artefacts were submitted with: 1–64 printable ASCII characters,
+            no space. railgate records it together with the transaction
+            reference of every settlement it allows, and denies a later
+            settlement that carries an identifier already recorded
+            (`REFERENCE_ALREADY_SETTLED`), whatever its transaction reference.
+        certSerial:
+          type: string
+          maxLength: 128
+          pattern: "^(0[xX])?[0-9a-fA-F]+$"
+          description: |
+            Serial number of the customer's signing certificate, hexadecimal,
+            optionally prefixed with 0x. Not decimal: a string of decimal
+            digits is read as hexadecimal and names a different certificate.
+        issuerDn:
+          type: string
+          maxLength: 512
+          description: Issuer distinguished name of the signing certificate, as an RFC 4514 string.
+        digestHex:
+          type: string
+          pattern: "^[0-9a-f]{128}$"
+          description: |
+            SHA-512 digest of the payout instruction payload the customer
+            signed, as 128 lowercase hexadecimal characters. (railgate
+            lowercases it before building the canonical string, so an
+            uppercase digest still verifies, but this specification requires
+            lowercase.)
+        signatureBase64:
+          type: string
+          format: byte
+          maxLength: 4096
+          description: |
+            The customer's signature over the digest, made with the HSM-bound
+            key of the certificate above, standard base64.
+        issuedAt:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339 timestamp at which the operator issued this answer.
+            Covered by the signature and used verbatim in the canonical string;
+            railgate does not check its format or its age.
+        operatorSignatureBase64:
+          type: string
+          format: byte
+          maxLength: 4096
+          description: Standard base64 of the operator's signature over the `op1` canonical bytes.
+        operatorSignatureAlgorithm:
+          type: string
+          enum:
+            - SHA256withRSA
+            - SHA384withRSA
+            - SHA512withRSA
+            - SHA256withECDSA
+            - SHA384withECDSA
+            - SHA512withECDSA
+            - Ed25519
+          description: |
+            JCA standard name of the signature algorithm. railgate accepts
+            exactly these spellings. ECDSA signatures are DER-encoded, as the
+            JCA `SHAxxxwithECDSA` algorithms produce them.
+        operatorKeyFingerprintHex:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Lowercase hexadecimal SHA-256 of the DER encoding of the SubjectPublicKeyInfo of the operator's signing certificate (not of the certificate itself), as the gatekeeper's publicKeyFingerprintHex.

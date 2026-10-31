@@ -12,9 +12,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * In-memory implementation of {@link PaymentNetworkClient} for development,
  * integration tests, and the reference-implementation demonstration flow.
  *
- * <p>Production deployments would substitute an HTTP-based client that
- * calls the payment-network operator's signature-retrieval endpoint
- * (Getswish AB in the Swedish deployment).
+ * <p>Production deployments would use {@link HttpPaymentNetworkClient}
+ * ({@code railgate.payment-network.mode=http}), which calls the
+ * signature-retrieval interface specified in
+ * {@code api/payment-network-operator.openapi.yaml} and verifies the
+ * operator's signature over each answer. No payment-network operator
+ * (Getswish AB in the Swedish deployment) offers that interface today.
+ * Artefacts registered here are not authenticated, and their
+ * {@code payoutInstructionId} is whatever the caller set (normally
+ * {@code null}).
  *
  * <p>This component is registered only when {@code railgate.payment-network.mode}
  * is set to {@code in-memory} (the default). To use a different client, set

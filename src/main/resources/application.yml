@@ -41,23 +41,41 @@ railgate:
     allow-insecure-http: false
 
   payment-network:
-    # In production, replace with an HTTP-based client that calls Getswish AB's
-    # signature-retrieval endpoint. The in-memory mode is for the reference
-    # implementation demonstration flow and integration tests.
+    # in-memory (default): reference demonstration flow and tests.
+    # file: local end-to-end runs; requires railgate.payment-network.file.
+    # http: HttpPaymentNetworkClient against the operator interface specified in
+    #   api/payment-network-operator.openapi.yaml (no operator offers it today).
+    #   Every 200 answer must carry an op1 signature that verifies under a
+    #   certificate in trusted-keys, or the settlement is denied with
+    #   OPERATOR_SIGNATURE_INVALID. Requires base-url and trusted-keys.
     mode: in-memory
+
+    # http mode only. The operator's base URL; GET {base-url}/v1/payout-artefacts/{ref}.
+    # Must be https:// unless allow-insecure-http is true.
+    # base-url: https://payment-network-operator.example
+    # Local development only: permits an http:// base-url and logs a WARN at start-up.
+    allow-insecure-http: false
+    # Name of a Spring Boot SSL bundle (spring.ssl.bundle.*) holding the client
+    # certificate for mTLS and the truststore for the operator. Empty: JVM defaults.
+    # ssl-bundle: payment-network
+    connect-timeout: PT2S
+    read-timeout: PT5S
+    # PEM file (classpath:, file: or a plain path) with the operator's signing
+    # certificate(s); operatorKeyFingerprintHex selects one by the SHA-256 of its
+    # DER SubjectPublicKeyInfo (lowercase hex, the gatekeeper /keys convention).
+    # trusted-keys: /etc/railgate/payment-network-operator.pem
 
   gatekeeper:
     # Base URL of the supervisor's gatekeeper instance. railgate calls
     # POST {base-url}/api/v1/verify with {certSerial, issuerDn, digestHex,
     # signatureBase64} to verify each settlement.
     #
-    # https is required. Over plain HTTP the verification verdict is neither
-    # confidential nor integrity-protected: railgate does not verify a
-    # signature over the gatekeeper's response, so an intermediary can rewrite
-    # signatureValid and compliant to true and the settlement proceeds. The
-    # port is the conventional 8443; the gatekeeper's own TLS listener is
-    # configured on its side (server.ssl.* in gatekeeper's application.yaml)
-    # or terminated by a reverse proxy in front of it.
+    # https is required. Over plain HTTP the request and the verdict are
+    # readable by any intermediary; without a signed verdict (below) they are
+    # also rewritable, and an intermediary could set signatureValid and
+    # compliant to true. The port is the conventional 8443; the gatekeeper's
+    # own TLS listener is configured on its side (server.ssl.* in gatekeeper's
+    # application.yaml) or terminated by a reverse proxy in front of it.
     base-url: https://localhost:8443
 
     # Escape hatch for a local development run against a gatekeeper started
@@ -70,6 +88,27 @@ railgate:
     # an unresponsive gatekeeper. ISO-8601 durations.
     connect-timeout: PT2S
     read-timeout: PT5S
+
+    # Signed verdicts. With require-signed-verdict true, a verdict is used only if
+    # it carries the gatekeeper's sv1 signature under a certificate in
+    # trusted-keys, over the request railgate sent, with verifiedAt within
+    # verdict-max-skew of railgate's clock; otherwise the settlement is denied
+    # with VERDICT_SIGNATURE_INVALID or VERDICT_STALE. If trusted-keys is empty
+    # while a signature is required, railgate starts, logs a WARN, and denies
+    # every settlement that reaches the gatekeeper. With require-signed-verdict
+    # false (the dev profile), unsigned verdicts are accepted and recorded as
+    # UNSIGNED; signed ones are verified if trusted-keys is set, and otherwise
+    # accepted unchecked as UNVERIFIED.
+    # trusted-keys: /etc/railgate/gatekeeper-signing.pem
+    require-signed-verdict: true
+    verdict-max-skew: PT60S
+
+  replay:
+    # Append-only journal of the transaction references (and operator payout
+    # instruction ids) railgate has allowed, fsynced per record and replayed at
+    # start-up. A settlement carrying either again is denied with
+    # REFERENCE_ALREADY_SETTLED. Unset: held in memory and lost on restart.
+    # path: /var/lib/railgate/replay.journal
 
   regulated:
     # Local-instrument codes that identify regulated payments subject to

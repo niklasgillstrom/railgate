@@ -13,8 +13,13 @@ and **gatekeeper**
 ## Why three components
 
 The triple **hsm + gatekeeper + railgate** operationalises a
-quadruple-triangulation model. Each component answers one specific
-question:
+quadruple-triangulation model over four data sources (Article 1 §6.2,
+Article 2 §9.3): Getswish AB's allocation register, the gatekeeper audit
+log, the RIX-INST settlement log and the recipient-side transaction
+registration. Of these the code produces the gatekeeper audit log; the
+other three are kept outside these repositories, and railgate's own
+decision log and replay record are not the RIX-INST settlement log. Each
+component answers one specific question:
 
 | Component  | Question answered                                                            |
 |------------|------------------------------------------------------------------------------|
@@ -46,7 +51,12 @@ central-bank settlement rail.
        (Swish utbetalning, and refunds of Swish Handel payments)
      • either flag missing → treated as regulated
        ↓
-   railgate → Getswish.getSignature(transactionReference)
+   railgate → payment-network operator: lookup(transactionReference)
+     (http mode: GET /v1/payout-artefacts/{ref}, answer signed op1,
+      verified under railgate.payment-network.trusted-keys)
+       ↓
+   railgate reserves the reference and payoutInstructionId
+     (already allowed or in flight → REFERENCE_ALREADY_SETTLED)
        ↓
    railgate → gatekeeper.verify(certSerial, issuerDn, digest, signature)
        ↓
@@ -54,10 +64,16 @@ central-bank settlement rail.
      1. Look up cert stored at Step 7 via (certSerial, issuerDn)
      2. Signature.getInstance("SHA512withRSA")
           .initVerify(publicKey); update(digest); verify(signature)
-     3. Check compliance status of audit entry
-     4. Return {signatureValid, compliant, reason}
+     3. Check compliance and lifecycle status of the registry entry
+     4. Return {signatureValid, compliant, reason, ...}
+     5. (1.7.0 or later) Sign the verdict over sv1
+       ↓
+   railgate verifies the verdict signature (1.7.0) under
+     railgate.gatekeeper.trusted-keys and its freshness
        ↓
    railgate decides: allow ↔ default-deny (block settlement)
+     allow → reference and payoutInstructionId committed (replay record)
+     deny  → both released
        ↓
 [Audit log entry recorded]
 ```
@@ -69,7 +85,11 @@ including gatekeeper 1.4.0 it did not exist: `POST /api/v1/verify` required
 a `signingCertificatePem` that railgate never sends, answered every
 railgate request with `MALFORMED_INPUT`, and railgate reported that to the
 originating bank as `SIGNATURE_INVALID`. Every regulated settlement was
-denied. railgate 1.5.0 requires gatekeeper 1.5.0 or later.
+denied. railgate 1.5.0 requires gatekeeper 1.5.0 or later. Step 5 exists
+from gatekeeper 1.7.0, and railgate 1.7.0 requires it by default
+(`railgate.gatekeeper.require-signed-verdict=true`): against an older
+gatekeeper every settlement that reaches it is denied with
+`VERDICT_SIGNATURE_INVALID`.
 
 **Wire contract.** railgate sends exactly four JSON properties, which are
 the required fields of gatekeeper's `SignatureVerificationRequest`:
@@ -81,7 +101,8 @@ the required fields of gatekeeper's `SignatureVerificationRequest`:
 | `digestHex`       | SHA-512, exactly 128 hexadecimal characters.                           | `@NotBlank`, `@Size(max = 256)` |
 | `signatureBase64` | Standard base64.                                                       | `@NotBlank`, `@Size(max = 4096)` |
 
-`signingCertificatePem` and `algorithm` are never sent. `GatekeeperClient`
+`signingCertificatePem` and `algorithm` are never sent, and neither is the
+operator's `payoutInstructionId`. `GatekeeperClient`
 checks every row before the call and answers `INVALID_SIGNATURE_MATERIAL`
 without calling the gatekeeper when one fails, so a request the gatekeeper
 would reject with a 400 does not become a `NETWORK_ERROR`. If no stored
@@ -196,13 +217,26 @@ minimisation and the proportionality requirement implicit in DORA Art 32
 supervisory data processing.
 
 railgate's own audit log records the transaction reference, the decision,
-the reason code and two gatekeeper references — not the BICs and not the
-flags. `gatekeeperAuditEntryId` is the gatekeeper's approval-registry
+the reason code, two gatekeeper references and, since 1.7.0, the status of
+the gatekeeper's verdict signature (`verdictSignature`: `VERIFIED`,
+`UNSIGNED`, `UNVERIFIED`, `INVALID`, or `null` when no verdict was used) —
+not the BICs and not the flags. `gatekeeperAuditEntryId` is the gatekeeper's approval-registry
 `verificationId`, shared by every settlement against the same certificate
 and `null` on `CERT_NOT_FOUND`; `gatekeeperAuditEntryHashHex` (gatekeeper
 1.5.0 and later) is the hash of the gatekeeper's own `SETTLEMENT_VERIFY`
 audit entry for the call, which identifies that one decision in the
-gatekeeper's hash-chained log.
+gatekeeper's hash-chained log. A `VERDICT_*` denial carries neither
+reference: railgate discards them from a verdict it did not accept.
+
+**The replay record** *(since 1.7.0)* is a second record at the rail. For
+every allowed settlement it keeps the transaction reference and, in `http`
+mode, the operator's `payoutInstructionId`; with `railgate.replay.path`
+set, each is written to a journal file with the time of the allow, one
+line per settlement, kept for good (it is never pruned). It holds no
+amounts, parties or payload, but it is a persistent, unbounded list of
+every regulated payout reference railgate has allowed, and its retention
+needs to be decided like any other record of the rail. No file
+permissions are set on it (the process umask applies).
 
 SHA-512 collision resistance ensures that a valid signature over the
 digest binds that signature to the payload the digest was taken over.
@@ -226,19 +260,24 @@ declares a serial in `RgltryRptg`, a different serial from the operator is
 denied as `DECLARED_CERT_MISMATCH`; nothing else is cross-checked.
 
 The second is reuse of a transaction reference. railgate looks the
-artefacts up by transaction reference and never records a reference as
-consumed. A settlement that carries the reference of an earlier, genuinely
-signed payout therefore receives that payout's artefacts, verifies, and is
-allowed — whoever submits it, including the originating bank itself.
-Whether a reference can settle twice depends on the settlement rail's own
-duplicate detection, not on railgate. A replay store is not added in this
-release: it would have to survive restarts, be shared across instances,
-and distinguish a replay from a legitimate resubmission after a deny or a
-downstream settlement failure, and an in-memory set does none of that.
+artefacts up by transaction reference. Until 1.6.0 it never recorded a
+reference as consumed, so a settlement that carried the reference of an
+earlier, genuinely signed payout received that payout's artefacts,
+verified, and was allowed — whoever submitted it, including the
+originating bank itself. Since 1.7.0 `ReplayGuard` allows each reference,
+and each operator `payoutInstructionId`, at most once (see "Replay
+protection" below), and keeps the record across restarts when
+`railgate.replay.path` is set. What remains: the record is local to one
+railgate instance and its journal, not shared across instances; without
+`railgate.replay.path` it is lost on restart; and a reference that railgate
+allowed but whose settlement then failed downstream cannot be allowed
+again, because there is no release. Whether a reference can settle twice
+across instances therefore still depends on the settlement rail's own
+duplicate detection.
 
 Closing the first requires the settlement message to carry the signed
-fields; closing the second requires the payment-network operator or the
-rail to bind each set of artefacts to a single settlement. Both are
+fields; closing the second fully requires the payment-network operator or
+the rail to bind each set of artefacts to a single settlement. Both are
 participation conditions for the rail rather than changes to this
 artefact: RIX terms are set by the system owner, and ISO 20022 provides
 the extension points. railgate implements what is verifiable given what
@@ -258,24 +297,32 @@ an oversized body. A pipeline must treat both as a deny.
 |----------------------------|------|-------|--------------------------------------------------------------------|
 | ALLOWED                    | 200  | true  | Signature verified and certificate compliant; settlement proceeds.  |
 | NOT_REGULATED              | 200  | true  | Explicitly classified, and not organisation-to-private. Passed through without verification. |
-| DORA_32_AUDIT_MISSING      | 403  | false | No signature artefacts found at the payment-network operator.       |
+| DORA_32_AUDIT_MISSING      | 403  | false | No signature artefacts found at the payment-network operator (in `http` mode: the operator answered 404). |
+| OPERATOR_SIGNATURE_INVALID | 403  | false | `http` mode only *(1.7.0)*: the operator answered 200, but the answer was not accepted — not signed over `op1` by a key in `railgate.payment-network.trusted-keys`, an algorithm outside the allow-list, an answer for another reference, or a body that is not the specified JSON. The gatekeeper was not called. |
+| REFERENCE_ALREADY_SETTLED  | 403  | false | *(1.7.0)* The transaction reference, or the operator's `payoutInstructionId`, was already allowed, or another evaluation holds it at this moment; the message says which key and which case. The gatekeeper was not called. |
 | DECLARED_CERT_MISMATCH     | 403  | false | The settlement request declares a certificate serial (`declaredCertSerial`, from pacs.008 `RgltryRptg`) that differs numerically from the payment-network operator's, or is not hexadecimal. The gatekeeper was not called. |
 | CERT_NOT_FOUND             | 403  | false | Certificate matches no gatekeeper audit entry — issuance was circumvented, or the wrong certificate was used. |
 | SIGNATURE_INVALID          | 403  | false | Cryptographic verification failed at the gatekeeper.                |
 | CERT_NON_COMPLIANT         | 403  | false | Certificate exists but was not issued through a compliant flow.     |
 | CERT_EXPIRED               | 403  | false | The signature verifies, but the certificate is outside its validity period (gatekeeper 1.6.0). |
+| CERT_SUPERSEDED            | 403  | false | The signature verifies, but the certificate's key was rotated by a key-lifecycle event at the gatekeeper (gatekeeper 1.7.0). |
+| CERT_REVOKED               | 403  | false | The signature verifies, but the certificate's key was revoked by a key-lifecycle event at the gatekeeper (gatekeeper 1.7.0). |
+| CERT_DECOMMISSIONED        | 403  | false | The signature verifies, but the certificate's key was decommissioned by a key-lifecycle event at the gatekeeper (gatekeeper 1.7.0). |
 | MALFORMED_INPUT            | 403  | false | The gatekeeper could not parse the request. Not a signature failure. |
 | ALGORITHM_NOT_SUPPORTED    | 403  | false | The gatekeeper would not run the signature algorithm. Not a signature failure. |
-| NETWORK_ERROR              | 403  | false | gatekeeper unreachable, timed out, or returned an unusable body.    |
+| NETWORK_ERROR              | 403  | false | gatekeeper unreachable, timed out, or returned an unusable body; in `http` mode also the payment-network operator unreachable, timed out, failing TLS, redirecting, or answering any status other than 200 and 404 (the message says which). |
+| VERDICT_SIGNATURE_INVALID  | 403  | false | *(1.7.0)* The gatekeeper's verdict was not accepted: unsigned while `railgate.gatekeeper.require-signed-verdict=true`, signature fields incomplete, key not in `railgate.gatekeeper.trusted-keys`, algorithm outside the allow-list, signature not verifying over the request railgate sent, an echoed field differing from it, or an unparseable `verifiedAt`. The gatekeeper was called, but its references are discarded. |
+| VERDICT_STALE              | 403  | false | *(1.7.0)* The verdict's signature verifies, but `verifiedAt` is more than `railgate.gatekeeper.verdict-max-skew` from railgate's clock, in either direction. |
 | INVALID_SIGNATURE_MATERIAL | 403  | false | The artefacts from the payment-network operator are malformed or outside the wire contract above (digest not 128 hex characters, signature not base64 or over 4096 characters, certificate serial not hexadecimal or over 128 characters, issuer DN not an RFC 4514 name or over 512 characters, any of them blank). The gatekeeper was not called. |
 | INVALID_REQUEST            | 400  | false | The settlement request failed Bean Validation — a missing party-type flag, a blank or over-36-character transaction reference, an over-long instrument code, declared certificate serial (128) or BIC (11). No verification was attempted. |
-| INTERNAL_ERROR             | 403  | false | Any unhandled failure inside railgate. Default-deny; no detail about the failure is returned to the caller. |
+| INTERNAL_ERROR             | 403  | false | Any unhandled failure inside railgate, and *(1.7.0)* an allow that could not be written to the replay journal (the reference is released). Default-deny; no detail about the failure is returned to the caller. |
 
-`CERT_NOT_FOUND`, `CERT_NON_COMPLIANT`, `CERT_EXPIRED`, `SIGNATURE_INVALID`,
+`CERT_NOT_FOUND`, `CERT_NON_COMPLIANT`, `CERT_EXPIRED`, `CERT_SUPERSEDED`,
+`CERT_REVOKED`, `CERT_DECOMMISSIONED`, `SIGNATURE_INVALID`,
 `MALFORMED_INPUT` and `ALGORITHM_NOT_SUPPORTED` are read from the
 gatekeeper's own `reason` field and passed through unchanged, as are
-`NETWORK_ERROR` and `INVALID_SIGNATURE_MATERIAL`, which railgate's client
-produces itself. That is every non-positive reason the gatekeeper
+`NETWORK_ERROR`, `INVALID_SIGNATURE_MATERIAL`, `VERDICT_SIGNATURE_INVALID`
+and `VERDICT_STALE`, which railgate's client produces itself. That is every non-positive reason the gatekeeper
 documents. Any other `reason` value falls back to a derivation from the two
 booleans, which yields `SIGNATURE_INVALID` when the signature did not
 verify and `CERT_NON_COMPLIANT` otherwise.
@@ -292,9 +339,9 @@ valid data, the transaction does not settle.
 
 ```bash
 mvn -B clean verify                          # build + tests
-NVD_API_KEY=... mvn -B -Powasp verify -DnvdApiKeyEnvironmentVariable=NVD_API_KEY   # OWASP Dependency-Check scan
+NVD_API_KEY=... mvn -B -Powasp verify   # OWASP Dependency-Check scan
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # local run without TLS, port 8082
-java -jar target/railgate-1.6.0.jar          # deployed: needs server.ssl (see below)
+java -jar target/railgate-1.7.0.jar          # deployed: needs server.ssl (see below)
 ```
 
 railgate does not start without TLS on its own listener
@@ -310,13 +357,23 @@ Configuration via `application.yml`:
 
 | Property                                    | Default                  | Purpose                                                                 |
 |---------------------------------------------|--------------------------|-------------------------------------------------------------------------|
-| `railgate.payment-network.mode`             | `in-memory`              | Payment-network operator client implementation: `in-memory`, or `file` for local end-to-end runs only |
+| `railgate.payment-network.mode`             | `in-memory`              | Payment-network operator client implementation: `in-memory`; `file` for local end-to-end runs only; or *(1.7.0)* `http`, the client for the operator interface in `api/payment-network-operator.openapi.yaml` |
 | `railgate.payment-network.file`             | *(empty)*                | Required when the mode is `file`: tab-separated artefacts (reference, certificate serial, issuer DN, digest, signature), re-read on every lookup. Not for production. |
+| `railgate.payment-network.base-url`         | *(empty)*                | `http` mode, required: the operator's base URL; railgate calls `GET {base-url}/v1/payout-artefacts/{ref}`. Must be `https://` unless the flag below is set. |
+| `railgate.payment-network.allow-insecure-http` | `false`               | Permit an `http://` operator base URL; logs a WARN. Local development only. |
+| `railgate.payment-network.ssl-bundle`       | *(empty)*                | Spring Boot SSL bundle with the mTLS client certificate and the truststore for the operator. Empty means JVM defaults; a bundle with ciphers or protocols set is refused at start-up. |
+| `railgate.payment-network.connect-timeout`  | `PT2S`                   | Connect timeout for the operator; must be positive. |
+| `railgate.payment-network.read-timeout`     | `PT5S`                   | Read timeout for the operator; must be positive. |
+| `railgate.payment-network.trusted-keys`     | *(empty)*                | `http` mode, required: PEM file (`classpath:`, `file:` or a path) with the operator's signing certificate(s). Missing, unreadable or empty stops start-up. |
 | `railgate.gatekeeper.base-url`              | `https://localhost:8443` | Supervisor's gatekeeper instance URL. Must be `https://` unless the flag below is set. |
 | `railgate.gatekeeper.allow-insecure-http`   | `false`                  | Permit a non-`https` base URL. Local development only — start-up fails without it, and logs a WARN with it. |
 | `railgate.gatekeeper.connect-timeout`       | `PT2S`                   | TCP connect timeout for gatekeeper calls (ISO-8601 duration)            |
 | `railgate.gatekeeper.read-timeout`          | `PT5S`                   | Response read timeout for gatekeeper calls (ISO-8601 duration). Exceeding either yields `NETWORK_ERROR` and a deny. |
 | `railgate.gatekeeper.ssl-bundle`            | *(empty)*                | Name of a Spring Boot SSL bundle (`spring.ssl.bundle.*`) whose trust and key material is used for the gatekeeper connection. Empty means the JVM default SSL context. An unknown name fails start-up. |
+| `railgate.gatekeeper.trusted-keys`          | *(empty)*                | *(1.7.0)* PEM file with the gatekeeper's verdict-signing certificate(s) — the certificate `GET /v1/gatekeeper/keys` publishes. Set but unreadable or without a certificate stops start-up; empty with a signature required starts with a WARN and denies every settlement that reaches the gatekeeper. |
+| `railgate.gatekeeper.require-signed-verdict` | `true` (`false` in `dev`) | *(1.7.0)* Require a signed gatekeeper verdict. `false` logs a WARN ("MUST NOT be deployed"). |
+| `railgate.gatekeeper.verdict-max-skew`      | `PT60S`                  | *(1.7.0)* Largest accepted distance between the verdict's `verifiedAt` and railgate's clock, either direction; zero allowed, negative stops start-up. |
+| `railgate.replay.path`                      | *(empty)*                | *(1.7.0)* Journal of allowed references and payout instruction ids. Empty: in memory only, lost on restart, with a WARN at start-up. The parent directory must exist. |
 | `railgate.regulated.local-instrument-codes` | `SWISH`                  | LclInstrm/Cd values that identify regulated payments. Matched case-insensitively, whitespace-trimmed. |
 
 ## Transport and authentication
@@ -347,15 +404,62 @@ on railgate's behalf (an egress proxy) is an equally valid arrangement; in
 that case point `base-url` at the proxy. This concerns the outbound link
 only: railgate's own listener must still have TLS (`ListenerTlsGuard`).
 
-**railgate does not verify signed gatekeeper responses.** The gatekeeper
-signs its receipts, and the verdict railgate consumes is not one of them:
-`POST /api/v1/verify` returns plain JSON, and `GatekeeperClient`
-deserialises `signatureValid` and `compliant` without checking any
-signature over them. The integrity of the verdict therefore rests entirely
-on the transport and on the gatekeeper's own controls. An attacker who can
-terminate or rewrite the TLS session can return `allow`. This is why the
-`https://` requirement is enforced rather than recommended, and it is the
-reason mTLS matters here beyond authentication. See `THREAT_MODEL.md`.
+**railgate verifies the gatekeeper's signed verdict** *(since 1.7.0)*.
+Up to 1.6.0 the verdict was plain JSON and its integrity rested entirely on
+the transport: an attacker who could terminate or rewrite the TLS session
+could return `allow`. gatekeeper 1.7.0 signs every `POST /api/v1/verify`
+response, denials included, with its receipt key over the canonical form
+
+```
+sv1|verifiedAt|certSerialHex|issuerDn|digestHex|signatureValid|compliant|reason|auditEntryId|auditEntryHashHex
+```
+
+and returns `verifiedAt`, `verdictSignatureBase64`,
+`verdictSignatureAlgorithm` and `signingKeyFingerprintHex` beside the
+verdict. `GatekeeperClient` (`VerdictVerifier`) checks, in this order:
+
+1. all four fields are present and non-blank;
+2. `signingKeyFingerprintHex` selects a certificate in
+   `railgate.gatekeeper.trusted-keys`;
+3. `verdictSignatureAlgorithm` is on the allow-list (`SHA256withRSA`,
+   `SHA384withRSA`, `SHA512withRSA`, `SHA256withECDSA`, `SHA384withECDSA`,
+   `SHA512withECDSA`, `Ed25519`; exact spelling);
+4. the signature verifies under that certificate over `sv1` built from the
+   `certSerial`, `issuerDn` and `digestHex` railgate **sent** (normalised:
+   serial without `0x`/`0X` as lower-case hex without leading zeros, issuer
+   in RFC 2253 form, digest lower-cased) and the other fields of the
+   verdict, so a verdict signed for any other request does not verify;
+5. any echoed `certSerial`, `issuerDn` or `digestHex` equals what was sent;
+6. `verifiedAt` parses as an instant;
+7. `|now − verifiedAt|` is at most `railgate.gatekeeper.verdict-max-skew`.
+
+Steps 1–6 failing is `VERDICT_SIGNATURE_INVALID`, step 7 `VERDICT_STALE`
+(reported only for an authentic verdict). The fingerprint is the lowercase
+hex SHA-256 of the signing certificate's DER SubjectPublicKeyInfo, 64
+characters without separators — the `publicKeyFingerprintHex` that
+gatekeeper publishes on `GET /v1/gatekeeper/keys`, not the SHA-256 of the
+certificate — so a certificate reissued for the same key keeps its
+fingerprint. At start-up railgate logs the fingerprints it computed for
+`trusted-keys`. Only the certificates in that file are trusted: their
+validity and revocation are not checked, and withdrawing one means
+removing it and restarting.
+
+A signed verdict is required by default. With
+`railgate.gatekeeper.require-signed-verdict=false` (the `dev` profile; logged
+at WARN) an unsigned verdict is used as before and recorded as `UNSIGNED`,
+and a signed one is still verified when `trusted-keys` is set, otherwise
+used unchecked and recorded as `UNVERIFIED`. With the requirement on but no
+`trusted-keys`, railgate starts with a WARN and denies every settlement
+that reaches the gatekeeper. `sv1` carries no per-call nonce: a genuine
+verdict for an identical `(certSerial, issuerDn, digestHex)` can be
+presented again within the skew window. The transport requirements above
+still apply. See `THREAT_MODEL.md`.
+
+**railgate → payment-network operator** *(since 1.7.0, `http` mode)*. See
+"Payment-network operator interface" below: `https://` required (unless
+`railgate.payment-network.allow-insecure-http=true`), mTLS through
+`railgate.payment-network.ssl-bundle`, and every answer signed by the
+operator.
 
 **Inbound, settlement rail → railgate.** `SecurityConfig` requires
 authentication on `/api/v1/**` with CSRF disabled and sessions stateless;
@@ -374,6 +478,80 @@ deployer's choice and is not fixed by this repo:
 railgate has no role model of its own — every caller of `/api/v1/**` is the
 settlement rail — so the chain authenticates without authorising further.
 
+## Payment-network operator interface
+
+railgate needs, for each regulated settlement, the digest, signature and
+certificate identifiers the originating bank submitted with the payout
+instruction. No operator offers an interface for that today. Since 1.7.0
+`api/payment-network-operator.openapi.yaml` (OpenAPI 3.0.3) specifies one,
+so that it can be required of an operator, for example through
+participation conditions, and `HttpPaymentNetworkClient`
+(`railgate.payment-network.mode=http`) implements the client side.
+
+- `GET {base-url}/v1/payout-artefacts/{transactionReference}` over mutual
+  TLS (stated in the description and marked `x-mutual-tls-required`;
+  OpenAPI 3.0 has no mTLS security scheme). railgate percent-encodes every
+  octet of the reference except `A-Z a-z 0-9 - . _ ~`, follows no
+  redirects and applies the configured timeouts.
+- 200 answers `PayoutArtefacts`: `transactionReference`,
+  `payoutInstructionId` (the operator's own identifier, 1–64 printable
+  ASCII characters), `certSerial`, `issuerDn`, `digestHex`,
+  `signatureBase64`, `issuedAt`, and the operator's
+  `operatorSignatureBase64`, `operatorSignatureAlgorithm` and
+  `operatorKeyFingerprintHex`. The operator signs the first seven over
+  `op1|transactionReference|payoutInstructionId|certSerialHex|issuerDn|digestHex|signatureBase64|issuedAt`
+  (normalisation and escaping as in the specification, which also gives a
+  worked example and its SHA-256). The fingerprint follows the gatekeeper's
+  `/keys` convention (SHA-256 of the DER SubjectPublicKeyInfo).
+- railgate accepts a 200 only if the body is at most 65 536 bytes of JSON
+  without duplicate keys, all ten properties are strings,
+  `transactionReference` is exactly the one requested, `payoutInstructionId`
+  matches its pattern, the `op1` bytes can be built, the fingerprint selects
+  a certificate in `railgate.payment-network.trusted-keys`, the algorithm is
+  on the allow-list and the signature verifies. Anything else is
+  `OPERATOR_SIGNATURE_INVALID`, and the gatekeeper is not called. 404 is
+  `DORA_32_AUDIT_MISSING`; any other status, a redirect, a timeout or a
+  transport failure is `NETWORK_ERROR`.
+- Not checked: the response `Content-Type`, the format and age of
+  `issuedAt`, and the validity and revocation of the pinned operator
+  certificates. Unknown properties are ignored and are not covered by the
+  signature.
+
+The operator's signature makes it accountable for the answer it gave; it
+does not show that the artefacts are those the bank submitted, nor that the
+operator holds no others for the reference. The client is tested against a
+reference operator built on `com.sun.net.httpserver` (with and without
+mTLS), not against Getswish AB or any real operator, and which field of
+Swish's payout API corresponds to `payoutInstructionId` is not established.
+The `in-memory` and `file` modes behave as before and carry no
+`payoutInstructionId`.
+
+## Replay protection
+
+*(Since 1.7.0.)* `ReplayGuard` allows each transaction reference, and each
+operator `payoutInstructionId`, at most once:
+
+- After the artefacts are found and the declared serial is checked, both
+  keys are reserved atomically. A key already allowed, or held by another
+  evaluation in flight, is refused at once with `REFERENCE_ALREADY_SETTLED`
+  (the second evaluation does not wait), and the gatekeeper is not called.
+- An allow commits both keys; a deny, or an exception before the commit,
+  releases them, so a denied settlement can be resubmitted.
+- With `railgate.replay.path` set, the commit appends one line
+  (`v1`, the URL-encoded reference, the URL-encoded payout id, the instant)
+  and forces it to disk before the allow is returned. The journal is held
+  under an exclusive file lock (a second process or guard fails start-up),
+  a torn last record is truncated at start-up with a WARN, any other
+  unreadable line stops start-up, and after a failed write every later
+  allow is `INTERNAL_ERROR` until restart. Without the path the record is
+  in memory and lost on restart, with a WARN at start-up.
+- `NOT_REGULATED` pass-throughs are neither checked nor recorded.
+
+Limits: the record is local to one instance; it is never pruned; it is not
+tamper-evident (no hash chain or signature, no file permissions set); and a
+reference that railgate allowed but whose settlement failed downstream
+cannot be allowed again.
+
 ## Endpoints
 
 | Method | Path                          | Purpose                                          |
@@ -389,7 +567,10 @@ has `springdoc.api-docs.enabled=false` and `springdoc.swagger-ui.enabled=false`.
 
 Sample precheck request. `transactionReference`, `debtorIsOrganization`
 and `creditorIsPrivatePerson` are required; omitting either flag is a 400,
-not a pass-through.
+not a pass-through. The response is the `SettlementDecision` (`allow`,
+`reasonCode`, `message`, the transaction reference and the gatekeeper
+references) and, since 1.7.0, `verdictSignature`, which is `null` on a
+decision taken without a gatekeeper verdict.
 
 ```json
 {

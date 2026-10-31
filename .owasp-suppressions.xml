@@ -9,5 +9,26 @@
     Article 9 ICT risk management cycle.
 -->
 <suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
-
+    <suppress>
+        <notes><![CDATA[
+        CVE-2026-47838 (SubjectDnX509PrincipalExtractor, CN parsing). Reported by Sonatype OSS Index for
+        spring-security-web 7.1.2. Spring's advisory (https://spring.io/security/cve-2026-47838) lists
+        5.7.x-6.5.10 as affected; 7.0.x was addressed under CVE-2026-22747; no 7.1.x version is listed.
+        railgate authenticates with HTTP Basic and has no X.509 authentication.
+        Decision 2026-10-31, reviewer Niklas Gillström. Re-review when spring-security-web changes version.
+        ]]></notes>
+        <packageUrl regex="true">^pkg:maven/org\.springframework\.security/spring-security-web@7\.1\.2$</packageUrl>
+        <cve>CVE-2026-47838</cve>
+    </suppress>
+    <suppress>
+        <notes><![CDATA[
+        CVE-2026-47842 (AesBytesEncryptor, all-zero IV in CBC mode). Reported by Sonatype OSS Index for
+        spring-security-crypto 7.1.2. Spring's advisory (https://spring.io/security/cve-2026-47842) lists
+        7.1.0 as the only affected 7.1.x version and 7.1.1 as fixed. No code in this repository uses
+        AesBytesEncryptor or Encryptors.
+        Decision 2026-10-31, reviewer Niklas Gillström. Re-review when spring-security-crypto changes version.
+        ]]></notes>
+        <packageUrl regex="true">^pkg:maven/org\.springframework\.security/spring-security-crypto@7\.1\.2$</packageUrl>
+        <cve>CVE-2026-47842</cve>
+    </suppress>
 </suppressions>

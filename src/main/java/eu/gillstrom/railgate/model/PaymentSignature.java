@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
  * <p>This shape is what {@code PaymentNetworkClient} returns and what
  * {@code GatekeeperClient} forwards to gatekeeper for verification.
  *
- * <p><b>Wire format.</b> The four fields are forwarded unchanged as the JSON
+ * <p><b>Wire format.</b> The four cryptographic fields are forwarded unchanged as the JSON
  * properties {@code certSerial}, {@code issuerDn}, {@code digestHex} and
  * {@code signatureBase64} of gatekeeper's {@code SignatureVerificationRequest}.
  * From gatekeeper 1.5.0 the gatekeeper resolves the signing certificate from
@@ -91,6 +91,20 @@ public class PaymentSignature {
      */
     @NotBlank
     private String issuerDn;
+
+    /**
+     * The payment-network operator's own identifier of the payout instruction
+     * these artefacts were submitted with. Supplied, and covered by the
+     * operator's signature, only by {@code HttpPaymentNetworkClient}
+     * ({@code railgate.payment-network.mode=http}); {@code null} in the
+     * {@code in-memory} and {@code file} modes.
+     *
+     * <p>Not forwarded to the gatekeeper. railgate uses it for replay
+     * protection: a payout instruction id that has already been allowed under
+     * any transaction reference is denied with
+     * {@code REFERENCE_ALREADY_SETTLED}.</p>
+     */
+    private String payoutInstructionId;
 
     public static BigInteger parseCertSerial(String certSerial) {
         if (certSerial == null

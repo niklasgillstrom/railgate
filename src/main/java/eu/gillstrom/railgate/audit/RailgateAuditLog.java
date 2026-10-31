@@ -1,6 +1,7 @@
 package eu.gillstrom.railgate.audit;
 
 import eu.gillstrom.railgate.model.SettlementDecision;
+import eu.gillstrom.railgate.model.VerdictSignatureStatus;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -28,8 +29,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * authoritative compliance record lives in gatekeeper. railgate only
  * records what railgate itself decided — not transaction payload content,
  * not signature material, not certificate detail. It keeps the decision,
- * the reason code and message, and the gatekeeper's audit-entry id and
- * hash, indexed by transaction reference, each field bounded in length.
+ * the reason code and message, the gatekeeper's audit-entry id and hash,
+ * and whether the gatekeeper's verdict was signed and verified
+ * ({@code verdictSignature}: {@code VERIFIED}, {@code UNSIGNED}, {@code UNVERIFIED},
+ * {@code INVALID}, or {@code null} when no verdict was consumed), indexed by
+ * transaction reference, each field bounded in length.
  *
  * <p>This minimisation aligns with GDPR Art 5(1)(c) and avoids creating
  * an unnecessary secondary record of payment activity at the central-bank
@@ -46,7 +50,8 @@ public class RailgateAuditLog {
             String reasonCode,
             String message,
             String gatekeeperAuditEntryId,
-            String gatekeeperAuditEntryHashHex
+            String gatekeeperAuditEntryHashHex,
+            VerdictSignatureStatus verdictSignature
     ) {}
 
     /**
@@ -107,7 +112,8 @@ public class RailgateAuditLog {
                 decision.getReasonCode(),
                 message,
                 gatekeeperAuditEntryId,
-                gatekeeperAuditEntryHashHex
+                gatekeeperAuditEntryHashHex,
+                decision.getVerdictSignature()
         );
         entries.addLast(entry);
         if (entryCount.incrementAndGet() > MAX_ENTRIES && entries.pollFirst() != null) {
@@ -123,9 +129,10 @@ public class RailgateAuditLog {
         }
 
         if (decision.isAllow()) {
-            log.info("Settlement ALLOWED: ref={} reason={} gatekeeperEntry={} gatekeeperEntryHash={}",
+            log.info("Settlement ALLOWED: ref={} reason={} gatekeeperEntry={} gatekeeperEntryHash={} "
+                    + "verdictSignature={}",
                     transactionReference, decision.getReasonCode(), gatekeeperAuditEntryId,
-                    gatekeeperAuditEntryHashHex);
+                    gatekeeperAuditEntryHashHex, decision.getVerdictSignature());
         } else {
             log.warn("Settlement DENIED: ref={} reason={} message={}",
                     transactionReference, decision.getReasonCode(), message);

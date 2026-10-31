@@ -28,8 +28,12 @@ import java.util.Optional;
  * or unreadable file, or a malformed line, yields no artefacts, which the
  * orchestrator answers with {@code DORA_32_AUDIT_MISSING}.
  *
+ * <p>The file carries no {@code payoutInstructionId}, so it is {@code null}
+ * on every artefact this client returns, and replay protection keys on the
+ * transaction reference alone.
+ *
  * <p>NOT for production: the payment-network operator is the only legitimate
- * source of signature artefacts.
+ * source of signature artefacts, and nothing in the file is authenticated.
  */
 @Component
 @ConditionalOnProperty(prefix = "railgate.payment-network", name = "mode", havingValue = "file")

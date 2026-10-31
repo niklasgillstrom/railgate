@@ -351,6 +351,29 @@ class SettlementOrchestratorTest {
     }
 
     @Test
+    void aCertificateMovedOnByAKeyLifecycleEventIsReportedWithTheGatekeepersReason() {
+        // The gatekeeper answers CERT_SUPERSEDED, CERT_REVOKED or
+        // CERT_DECOMMISSIONED, with signatureValid=true, once a lifecycle
+        // event has moved the certificate's registry entry.
+        for (String reason : new String[] {"CERT_SUPERSEDED", "CERT_REVOKED", "CERT_DECOMMISSIONED"}) {
+            SettlementRequest request = regulatedRequest("TXREF-" + reason);
+            registerSignature("TXREF-" + reason);
+            when(gatekeeperClient.verify(any())).thenReturn(VerificationResult.builder()
+                    .signatureValid(true)
+                    .compliant(false)
+                    .auditEntryId("VID-1")
+                    .reason(reason)
+                    .build());
+
+            SettlementDecision decision = orchestrator.evaluate(request);
+
+            assertThat(decision.isAllow()).as(reason).isFalse();
+            assertThat(decision.getReasonCode()).as("not CERT_NON_COMPLIANT").isEqualTo(reason);
+            assertThat(decision.getAuditEntryId()).isEqualTo("VID-1");
+        }
+    }
+
+    @Test
     void algorithmNotSupportedFromGatekeeperIsNotReportedAsSignatureInvalid() {
         SettlementRequest request = regulatedRequest("TXREF-11");
         registerSignature("TXREF-11");

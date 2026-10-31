@@ -2,6 +2,7 @@ package eu.gillstrom.railgate.client;
 
 import eu.gillstrom.railgate.audit.RailgateAuditLog;
 import eu.gillstrom.railgate.model.PaymentSignature;
+import eu.gillstrom.railgate.model.VerdictSignatureStatus;
 import eu.gillstrom.railgate.model.VerificationResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -22,6 +23,7 @@ import javax.net.ssl.SSLSocketFactory;
 import javax.security.auth.x500.X500Principal;
 import java.io.IOException;
 import java.net.HttpURLConnection;
+import java.time.Clock;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.HashMap;
@@ -44,12 +46,29 @@ import java.util.regex.Pattern;
  * the orchestrator can apply default-deny without conflating crypto failure
  * with infrastructure failure.
  *
- * <p><b>What this client does not do.</b> The gatekeeper's response is
- * consumed as plain JSON over the transport. railgate does not verify a
- * signature over that response, so the integrity of the verdict rests on the
- * transport (TLS, and mTLS where the deployer configures it) and on the
- * gatekeeper's own controls — not on anything this class checks. See
- * {@code THREAT_MODEL.md} (Spoofing, Tampering).
+ * <p><b>Signed verdicts.</b> Every verdict is passed to a
+ * {@link VerdictVerifier}. With {@code railgate.gatekeeper.require-signed-verdict=true}
+ * (the default) a verdict is used only if it carries the gatekeeper's
+ * {@code sv1} signature, made under a certificate in
+ * {@code railgate.gatekeeper.trusted-keys}, over the request railgate sent,
+ * with a {@code verifiedAt} within {@code railgate.gatekeeper.verdict-max-skew};
+ * otherwise the result is a deny with {@code VERDICT_SIGNATURE_INVALID} or
+ * {@code VERDICT_STALE}. With the property {@code false}, a verdict without
+ * signature fields is used as before and marked
+ * {@link VerdictSignatureStatus#UNSIGNED}; its integrity then rests on the
+ * transport alone. With the property {@code false}, a signed verdict is
+ * verified when {@code trusted-keys} is configured, and used unchecked as
+ * {@link VerdictSignatureStatus#UNVERIFIED} when it is not.
+ *
+ * <p><b>What this client does not do.</b> A verified signature shows that the
+ * holder of a pinned gatekeeper key signed this verdict over the
+ * {@code certSerial}, {@code issuerDn} and {@code digestHex} railgate sent,
+ * stating a {@code verifiedAt} within the skew window of railgate's clock.
+ * {@code sv1} carries no per-call nonce, so it does not bind the verdict to
+ * this particular call: a verdict captured for an identical
+ * {@code (certSerial, issuerDn, digestHex)} can be presented again within that
+ * window. It says nothing about whether the gatekeeper's own decision was
+ * right.
  */
 @Component
 @Slf4j
@@ -65,6 +84,8 @@ public class GatekeeperClient {
     private static final int MAX_LOGGED_ERROR_LENGTH = 512;
 
     private final RestTemplate restTemplate;
+
+    private final VerdictVerifier verdictVerifier;
 
     private String gatekeeperBaseUrl;
 
@@ -93,10 +114,20 @@ public class GatekeeperClient {
      * Without it the JVM default SSL context applies. The bundle is resolved
      * here, at start-up, for the same reason as the scheme check.</p>
      *
+     * <p>{@code railgate.gatekeeper.trusted-keys} (PEM, one or more gatekeeper
+     * signing certificates), {@code require-signed-verdict} (default
+     * {@code true}) and {@code verdict-max-skew} (default {@code PT60S})
+     * configure the {@link VerdictVerifier}. An empty {@code trusted-keys}
+     * with a signature required does not stop start-up; it logs a WARN, and
+     * every verdict is then rejected with {@code VERDICT_SIGNATURE_INVALID}.</p>
+     *
      * @throws IllegalStateException when the base URL is not {@code https://}
      *     and {@code railgate.gatekeeper.allow-insecure-http} has not been
-     *     set to {@code true}, or when the named SSL bundle sets ciphers or
-     *     enabled protocols, which {@code HttpURLConnection} cannot apply
+     *     set to {@code true}, when the named SSL bundle sets ciphers or
+     *     enabled protocols, which {@code HttpURLConnection} cannot apply,
+     *     when {@code railgate.gatekeeper.trusted-keys} is set but cannot be
+     *     read or holds no certificate, or when
+     *     {@code railgate.gatekeeper.verdict-max-skew} is negative
      * @throws org.springframework.boot.ssl.NoSuchSslBundleException when
      *     {@code railgate.gatekeeper.ssl-bundle} names no configured bundle
      */
@@ -107,11 +138,22 @@ public class GatekeeperClient {
             @Value("${railgate.gatekeeper.read-timeout:PT5S}") Duration readTimeout,
             @Value("${railgate.gatekeeper.allow-insecure-http:false}") boolean allowInsecureHttp,
             @Value("${railgate.gatekeeper.ssl-bundle:}") String sslBundle,
-            ObjectProvider<SslBundles> sslBundles) {
+            ObjectProvider<SslBundles> sslBundles,
+            @Value("${railgate.gatekeeper.trusted-keys:}") String trustedKeys,
+            @Value("${railgate.gatekeeper.require-signed-verdict:true}") boolean requireSignedVerdict,
+            @Value("${railgate.gatekeeper.verdict-max-skew:PT60S}") Duration verdictMaxSkew) {
         this(gatekeeperBaseUrl, connectTimeout, readTimeout, allowInsecureHttp, sslBundle,
-                sslBundles.getIfAvailable());
+                sslBundles.getIfAvailable(),
+                VerdictVerifier.fromConfiguration(trustedKeys, requireSignedVerdict, verdictMaxSkew,
+                        Clock.systemUTC()));
     }
 
+    /**
+     * Without verdict-signature enforcement
+     * ({@link VerdictVerifier#unsignedAccepted()}): every verdict is used, and
+     * marked {@code UNSIGNED} or {@code UNVERIFIED}. The Spring-managed bean is
+     * built by the constructor above, from {@code railgate.gatekeeper.*}.
+     */
     public GatekeeperClient(
             String gatekeeperBaseUrl,
             Duration connectTimeout,
@@ -127,6 +169,19 @@ public class GatekeeperClient {
             boolean allowInsecureHttp,
             String sslBundle,
             SslBundles sslBundles) {
+        this(gatekeeperBaseUrl, connectTimeout, readTimeout, allowInsecureHttp, sslBundle, sslBundles,
+                VerdictVerifier.unsignedAccepted());
+    }
+
+    GatekeeperClient(
+            String gatekeeperBaseUrl,
+            Duration connectTimeout,
+            Duration readTimeout,
+            boolean allowInsecureHttp,
+            String sslBundle,
+            SslBundles sslBundles,
+            VerdictVerifier verdictVerifier) {
+        this.verdictVerifier = java.util.Objects.requireNonNull(verdictVerifier, "verdictVerifier");
 
         String baseUrl = gatekeeperBaseUrl == null ? "" : gatekeeperBaseUrl.trim();
 
@@ -137,14 +192,16 @@ public class GatekeeperClient {
                         + baseUrl + "'). The digest, signature and certificate identifiers "
                         + "railgate forwards to the gatekeeper, and the verdict it receives "
                         + "back, are unauthenticated over plain HTTP: an intermediary can "
-                        + "read them and can rewrite signatureValid/compliant to true. "
+                        + "read them, and unless a signed verdict is required and verified "
+                        + "(railgate.gatekeeper.require-signed-verdict) it can rewrite "
+                        + "signatureValid/compliant to true. "
                         + "Set railgate.gatekeeper.allow-insecure-http=true to override this "
                         + "for a local development run only.");
             }
             log.warn("railgate.gatekeeper.base-url is '{}' and "
                     + "railgate.gatekeeper.allow-insecure-http=true. Gatekeeper traffic is "
-                    + "unencrypted and the verification verdict is not integrity-protected. "
-                    + "This configuration MUST NOT be deployed.", baseUrl);
+                    + "unencrypted, and the verdict is integrity-protected only by its signature, "
+                    + "when one is verified. This configuration MUST NOT be deployed.", baseUrl);
         }
 
         this.gatekeeperBaseUrl = baseUrl;
@@ -184,9 +241,18 @@ public class GatekeeperClient {
         };
     }
 
-    /** For tests: inject a RestTemplate that MockRestServiceServer is bound to. */
+    /**
+     * For tests: inject a RestTemplate that MockRestServiceServer is bound to.
+     * Verdicts are checked as by {@link VerdictVerifier#unsignedAccepted()}.
+     */
     GatekeeperClient(RestTemplate restTemplate) {
+        this(restTemplate, VerdictVerifier.unsignedAccepted());
+    }
+
+    /** For tests: a RestTemplate and the verdict verifier to apply. */
+    GatekeeperClient(RestTemplate restTemplate, VerdictVerifier verdictVerifier) {
         this.restTemplate = restTemplate;
+        this.verdictVerifier = java.util.Objects.requireNonNull(verdictVerifier, "verdictVerifier");
     }
 
     public VerificationResult verify(PaymentSignature signature) {
@@ -231,6 +297,21 @@ public class GatekeeperClient {
                         .reason("NETWORK_ERROR")
                         .build();
             }
+            VerdictVerifier.Check check = verdictVerifier.check(signature, result);
+            if (check.status() == VerdictSignatureStatus.INVALID) {
+                // Nothing from a rejected verdict is carried forward: its
+                // flags, reason and audit references are all unauthenticated.
+                log.warn("Rejecting gatekeeper verdict for cert {}: {} ({})",
+                        RailgateAuditLog.sanitise(signature.getCertSerial(), Integer.MAX_VALUE),
+                        check.reasonCode(), check.detail());
+                return VerificationResult.builder()
+                        .signatureValid(false)
+                        .compliant(false)
+                        .reason(check.reasonCode())
+                        .verdictSignature(VerdictSignatureStatus.INVALID)
+                        .build();
+            }
+            result.setVerdictSignature(check.status());
             return result;
 
         } catch (RestClientException ex) {

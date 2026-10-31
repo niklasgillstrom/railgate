@@ -1,12 +1,23 @@
 # Peer-review guide — railgate
 
-This document is written for a peer reviewer of Article 1 (Gillström, in preparation; target venue: *Capital Markets Law Journal*) and Article 2 (Gillström, in preparation; target venue: *Computer Law & Security Review*) who wants to reproduce the central settlement-layer-enforcement claims those articles make. The companion repos `hsm/` and `gatekeeper/` complete the **triadic system** (since v1.2.0) described in Article 1 §4.2 and §4.3 and in Article 2 §6.1 and §9.3:
+This document is written for a peer reviewer of Article 1 (Gillström, in preparation; target venue: *Capital Markets Law Journal*) and Article 2 (Gillström, in preparation; target venue: *Computer Law & Security Review*) who wants to reproduce the central settlement-layer-enforcement claims those articles make. The companion repos `hsm/` and `gatekeeper/` complete the **triadic system** (since v1.2.0) described in Article 1 §4.3 and §6.2 and in Article 2 §6.1 and §9.3 (section numbers of the manuscripts revised on 2026-10-30):
 
 - **hsm** carries the verifier core (financial-entity side).
 - **gatekeeper** is the NCA-operated supervisory API; from v1.1.0 also exposes the settlement-time signature verification endpoint that railgate consumes.
 - **railgate** (this repo) is the central-bank settlement-rail enforcement layer that calls gatekeeper's verification endpoint at settlement time (RIX-INST in Sweden; generalisable to TIPS, FedNow, FPS, NPP).
 
-The three components together operationalise the data-minimised quadruple-triangulation model: only digest, signature, and certificate identifiers traverse the supervisor boundary — no transaction payload content is exposed at any layer.
+The three components together operationalise the data-minimised quadruple-triangulation model over four data sources — Getswish AB's allocation register, the gatekeeper audit log, the RIX-INST settlement log and the recipient-side transaction registration — of which the code produces the gatekeeper audit log; the other three, the RIX-INST settlement log included, are external (railgate's own decision log is not that log). Only digest, signature, and certificate identifiers traverse the supervisor boundary — no transaction payload content is exposed at any layer.
+
+---
+
+## Version 1.7.0 — what changed and what to verify
+
+- **Signed gatekeeper verdict.** railgate verifies gatekeeper 1.7.0's signature over `sv1` before acting on a verdict, under the certificates in `railgate.gatekeeper.trusted-keys`, over the request it sent, and within `railgate.gatekeeper.verdict-max-skew`; required by default. Verify with `VerdictCanonicalizerTest.goldenExampleSharedWithTheGatekeeper` (the same golden string as gatekeeper's `SettlementVerdictCanonicalizerGoldenTest`), `GatekeeperClientSignedVerdictTest` (a verdict signed for another request is rejected even without echo fields; an untrusted key claiming the trusted fingerprint is rejected; a stale but badly signed verdict is reported as invalid, not stale) and `TrustedCertificatesTest` (the key fingerprint is the SHA-256 of the SubjectPublicKeyInfo, as on gatekeeper's `/v1/gatekeeper/keys`).
+- **Payment-network operator interface** (`api/payment-network-operator.openapi.yaml`) and its client (`railgate.payment-network.mode=http`): answers signed over `op1` by a pinned operator key. `HttpPaymentNetworkClientTest` runs against a reference operator, including mTLS, and `theSpecificationDescribesThePathTheClientCalls` parses the YAML and checks the path, the allow-list and the `op1` hash. No operator offers the interface; nothing was tested against Getswish AB.
+- **Replay protection** (`ReplayGuard`): each transaction reference and operator payout instruction id is allowed at most once. `ReplayGuardTest.ofManyConcurrentAttemptsOnOneReferenceExactlyOneCommits`, `SettlementOrchestratorHardeningTest.ofManyUnsynchronisedEvaluationsOfOneReferenceAtMostOneIsAllowed`, `SettlementPipelineIntegrationTest.aSignedPayoutIsAllowedOnceAndItsReplaysAreRefusedAcrossARestart`.
+- **Lifecycle denials** of gatekeeper 1.7.0 (`CERT_SUPERSEDED`, `CERT_REVOKED`, `CERT_DECOMMISSIONED`) are passed through.
+
+Reviewers should start with `mvn -B test` (206 tests). Those results were obtained with the 1.7.0 dependency versions (2026-10-31); PIT kills every one of the 497 mutants of the 1.7.0 code.
 
 ---
 
@@ -16,11 +27,11 @@ The three components together operationalise the data-minimised quadruple-triang
 
 - A **reference implementation** of settlement-rail enforcement as described in Article 1 §4.3 and §6.2 and in Article 2 §6.1 and §9.3. Railgate sits at the central-bank settlement rail and performs deterministic cryptographic signature verification at settlement time, blocking any settlement that cannot be matched to a compliant gatekeeper audit entry.
 - A **demonstration** of the data-minimisation contract: the supervisor never sees transaction payload content, only the SHA-512 digest, the signature, and the certificate identifiers. SHA-512 collision resistance binds the signature to the payload the digest was taken over — not, by itself, to the pacs.008 message being settled; see the note on the residual binding assumption in `README.md`.
-- A **default-deny enforcement** prototype with structured reason codes returned to the originating bank. The complete set is `ALLOWED`, `NOT_REGULATED`, `DORA_32_AUDIT_MISSING`, `DECLARED_CERT_MISMATCH`, `CERT_NOT_FOUND`, `SIGNATURE_INVALID`, `CERT_NON_COMPLIANT`, `CERT_EXPIRED`, `MALFORMED_INPUT`, `ALGORITHM_NOT_SUPPORTED`, `NETWORK_ERROR`, `INVALID_SIGNATURE_MATERIAL`, `INVALID_REQUEST`, `INTERNAL_ERROR`; `README.md` tabulates each with its HTTP status. No other value is reachable.
+- A **default-deny enforcement** prototype with structured reason codes returned to the originating bank. The complete set is `ALLOWED`, `NOT_REGULATED`, `DORA_32_AUDIT_MISSING`, `OPERATOR_SIGNATURE_INVALID`, `REFERENCE_ALREADY_SETTLED`, `DECLARED_CERT_MISMATCH`, `CERT_NOT_FOUND`, `SIGNATURE_INVALID`, `CERT_NON_COMPLIANT`, `CERT_EXPIRED`, `CERT_SUPERSEDED`, `CERT_REVOKED`, `CERT_DECOMMISSIONED`, `MALFORMED_INPUT`, `ALGORITHM_NOT_SUPPORTED`, `NETWORK_ERROR`, `VERDICT_SIGNATURE_INVALID`, `VERDICT_STALE`, `INVALID_SIGNATURE_MATERIAL`, `INVALID_REQUEST`, `INTERNAL_ERROR`; `README.md` tabulates each with its HTTP status. No other value is reachable.
 
 **Isn't:**
 
-- A production-ready integration with Sveriges Riksbank's RIX-INST or any other central-bank settlement system. Production deployment requires substituting the in-memory `PaymentNetworkClient` for an HTTP-based client against the actual payment-network operator's signature-retrieval endpoint, configuring the gatekeeper URL for the supervisor's instance, and integrating with the central bank's pacs.008 processing pipeline. None of those integration points is part of this repo.
+- A production-ready integration with Sveriges Riksbank's RIX-INST or any other central-bank settlement system. Production deployment requires a payment-network operator that offers the artefact interface railgate's `http` mode calls (specified in `api/payment-network-operator.openapi.yaml` since 1.7.0; no operator offers it today), configuring the gatekeeper URL and its verdict-signing certificate for the supervisor's instance, and integrating with the central bank's pacs.008 processing pipeline. Only the client side of the first is part of this repo.
 - An ISO 20022 parser. The `SettlementRequest` model abstracts the fields railgate needs (`transactionReference`, `localInstrumentCode`, debtor/creditor identification flags, BICs); a production deployment would receive the full pacs.008 message and parse the relevant fields. The abstraction here keeps the reference focused on the verification orchestration logic.
 
 ---
@@ -33,7 +44,7 @@ Beyond that:
 
 - **Missing party-type classification is no longer a pass-through.** `debtorIsOrganization` and `creditorIsPrivatePerson` were primitives, so an omitted field deserialised to `false` — read as private-to-private, the one shape railgate passes through with `allow=true`. They are `Boolean` with `@NotNull`; a missing flag is a 400, and a request that reaches the detector without one is treated as regulated.
 - **The claim that structural derivation "cannot be circumvented by the originating bank" was wrong** and has been corrected here, in `README.md` and in `CROSS_REFERENCE.md`. The flags are metadata from the settlement system; railgate does not parse the pacs.008 and cannot recompute them.
-- **The gatekeeper base URL must be `https://`,** enforced at start-up. railgate does not verify a signature over the gatekeeper's verdict, so the transport is the whole of the integrity guarantee — `THREAT_MODEL.md` now says so instead of claiming a signed response the code never checks.
+- **The gatekeeper base URL must be `https://`,** enforced at start-up. railgate does not verify a signature over the gatekeeper's verdict, so the transport is the whole of the integrity guarantee — `THREAT_MODEL.md` now says so instead of claiming a signed response the code never checks. *(Superseded in 1.7.0: the verdict is signed by gatekeeper 1.7.0 and verified by railgate.)*
 - **Exceptions produce a deny,** not an HTTP 500 with a non-`SettlementDecision` body. `SettlementExceptionHandler` returns 403 / `INTERNAL_ERROR` for anything unhandled and 400 / `INVALID_REQUEST` for a validation failure, carries no exception detail, and audits both.
 - **`CERT_NOT_FOUND` reaches the bank as `CERT_NOT_FOUND`.** The orchestrator reads the gatekeeper's `reason` before deriving a code from the two booleans, which previously collapsed the circumvented-issuance case into `SIGNATURE_INVALID`. The unreachable `VERIFICATION_FAILED` branch is gone.
 - **`/api/v1/**` has a security configuration.** There was no `SecurityFilterChain` bean, so Boot's session-and-CSRF default applied to a stateless machine API.
@@ -70,9 +81,9 @@ Reviewers approaching v1.2.0 should focus on the following:
 
 ## Requirements
 
-- **Java 21 or later**: the build targets Java 21 (`java.version` in `pom.xml`). Spring Boot 4.1.1 itself requires Java 17 and is compatible up to and including Java 26.
-- **Maven 3.6.3** or later (enforced by `maven-enforcer-plugin`)
-- Access to a running gatekeeper instance for end-to-end testing (defaults to `https://localhost:8443`, and a non-`https` URL is refused at start-up unless `railgate.gatekeeper.allow-insecure-http=true`). No live gatekeeper is required for `mvn -B test`: the orchestrator tests mock `GatekeeperClient`, the client tests drive the real client against `MockRestServiceServer`, and `ApplicationContextLoadsTest` constructs the client without calling it.
+- **Java 21 or later**: the build targets Java 21 (`java.version` in `pom.xml`), on the Spring Boot 4.1.2 parent (4.1.1 until 1.6.0).
+- **Maven 3.8.1** or later (enforced by `maven-enforcer-plugin`)
+- Access to a running gatekeeper instance for end-to-end testing (defaults to `https://localhost:8443`, and a non-`https` URL is refused at start-up unless `railgate.gatekeeper.allow-insecure-http=true`). No live gatekeeper is required for `mvn -B test`: the orchestrator tests mock `GatekeeperClient`, the client tests drive the real client against `MockRestServiceServer`, `ApplicationContextLoadsTest` constructs the client without calling it, and since 1.7.0 the operator and pipeline tests start a reference operator and a reference gatekeeper (`com.sun.net.httpserver`) on loopback.
 
 ---
 
@@ -85,13 +96,13 @@ mvn -B clean verify
 Expected output:
 
 ```
-[INFO] Tests run: 93, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 206, Failures: 0, Errors: 0, Skipped: 0
 [INFO] BUILD SUCCESS
 ```
 
-The 93 tests are distributed as follows.
+The 206 tests (93 in 1.6.0) are distributed as follows.
 
-`SettlementOrchestratorTest` (25):
+`SettlementOrchestratorTest` (26):
 
 1. `allowsSettlementWhenSignatureVerifiesAndCertCompliant` — happy path; gatekeeper returns `signatureValid=true, compliant=true`.
 2. `deniesWhenSignatureMissingFromPaymentNetwork` — payment-network operator has no record → `DORA_32_AUDIT_MISSING`.
@@ -118,6 +129,7 @@ The 93 tests are distributed as follows.
 23. `anOperatorSerialThatIsNotHexadecimalIsLeftToTheMaterialCheck` — an unparseable operator serial is not a `DECLARED_CERT_MISMATCH`; the gatekeeper client's material check answers.
 24. `aBlankInstrumentCodeIsNotARegulatedCode` — `"   "` does not match a configured code.
 25. `theDetectorTreatsAnAbsentRequestAsRegulated` — `RegulatedPaymentDetector.isRegulated(null)` is true.
+26. `aCertificateMovedOnByAKeyLifecycleEventIsReportedWithTheGatekeepersReason` *(1.7.0)* — gatekeeper's `CERT_SUPERSEDED`, `CERT_REVOKED` and `CERT_DECOMMISSIONED` pass through.
 
 `GatekeeperClientTest` (26): the five transport tests from 1.3.0 (data-minimisation contract, server error, empty body, unparseable body, foreign JSON), three start-up tests for the `https://` requirement and its override, and four for the cryptographic-material checks (short digest, non-hex digest, non-base64 signature, blank certificate serial or issuer DN) — each asserting that no call to the gatekeeper is made. Added in 1.5.0: the contract test against gatekeeper's `SignatureVerificationRequest` (`requestBodyMatchesTheGatekeeperSignatureVerificationRequest`), values at and beyond the gatekeeper's `@Size` limits, a non-hexadecimal certificate serial, an issuer DN that is not an RFC 4514 name, a transport error whose message carries CR/LF, and five tests for the SSL bundle (none configured, blank name, bundle applied to the connection, unknown bundle, bundle with cipher or protocol options). Added after the 1.5.0 review: `readsTheSettlementAuditEntryHashFromTheGatekeeperResponse`, the gatekeeper's `auditEntryHashHex` deserialised next to `auditEntryId`. Added in 1.6.0: the configured connect and read timeouts bound the gatekeeper connection, and each malformed artefact is logged by the field it concerns and never with its value.
 
@@ -139,9 +151,21 @@ The 93 tests are distributed as follows.
 
 `OpenApiExposureDefaultProfileTest` (2) and `OpenApiExposureDevProfileTest` (2): `/v3/api-docs` and `/swagger-ui.html` are 404 under the shipped configuration and served only with the `dev` profile.
 
-**Mutation testing.** `mvn -Ppit test-compile org.pitest:pitest-maven:mutationCoverage` runs PIT 1.30.0 with the JUnit 5 plugin over every production class (reports in `target/pit-reports/`). In 1.6.0 every one of the 185 mutants is killed, and the profile fails below 100 % (`mutationThreshold`). Three mutants of the first run could not be killed because the mutated code behaved identically; the constructs behind them were redundant and are gone: an explicit `Content-Type` that Jackson's converter sets anyway (still asserted by `forwardsExactlyTheFourDataMinimisedFields`), a truncation guard whose boundary returned the same string (`sanitise` now takes `substring(0, min(length, max))`), and an early return for a zero-byte read in the counting stream.
+New in 1.7.0:
 
-OWASP Dependency-Check runs with the `owasp` profile (`mvn -B -Powasp verify`; not in the default build since 1.6.0) and passes without suppressions (`.owasp-suppressions.xml` is empty). The plugin stays at 12.2.2: 13.0.0 cannot update its NVD data without an NVD API key (dependency-check/DependencyCheck#8715, fixed for the unreleased 13.0.1). The earlier DOMPurify finding inside swagger-ui was resolved by pinning `org.webjars:swagger-ui` (5.32.15 since 1.5.0); Tomcat is overridden to 11.0.26 for the same reason (see `CHANGELOG.md`, Dependencies). Swagger UI itself is served only under the `dev` profile.
+`GatekeeperClientSignedVerdictTest` (25): a signed verdict over the request is verified and a signed denial keeps its reason; the gatekeeper may normalise what it signs and echoes; unknown response fields are ignored; a bad signature, a verdict changed after signing, an untrusted key, an untrusted key claiming the trusted fingerprint, an algorithm outside the allow-list, tampered echo fields, a verdict signed for another request, an unsigned verdict when one is required, incomplete signature fields and an unparseable `verifiedAt` are `VERDICT_SIGNATURE_INVALID`; a verdict outside the skew in either direction is `VERDICT_STALE`, but a stale one with a bad signature is invalid; the three modes without a requirement (`UNSIGNED`, checked when a key is trusted, `UNVERIFIED`); the test seam behaves as before; configuration read at start-up; a required signature without a trusted key starts with a WARN; the verdict names its key by the `/keys` fingerprint, a verdict naming it by the certificate hash is rejected, and another certificate for the same key verifies.
+
+`HttpPaymentNetworkClientTest` (22): a signed answer from a trusted operator key is accepted, with RSA and ECDSA; the reference is percent-encoded and echoed decoded; unknown properties are ignored; a bad signature, an artefact changed after signing, an untrusted key, an untrusted key claiming a trusted fingerprint, an answer for another reference, an algorithm outside the allow-list, malformed answers, a property that is not a string and an answer naming the key by the certificate hash are rejected; 404 is not-found, any other status, a read timeout and a refused connection are unavailable; the SSL bundle supplies the mTLS client certificate; plain HTTP is refused unless allowed and then warned; missing base URL, trust or timeout and an SSL bundle with options are start-up failures; the specification describes the path the client calls.
+
+`ReplayGuardTest` (11), `SettlementOrchestratorHardeningTest` (15) and `SettlementPipelineIntegrationTest` (4): the replay record, its journal across a restart, concurrency (32 threads × 50 attempts; 64 evaluations on 16 threads; exactly one allow), the order lookup → replay check → gatekeeper, release on deny and on exception, and the end-to-end pipeline with a reference operator, a reference gatekeeper and a journal on disk.
+
+`VerdictCanonicalizerTest` (4), `OperatorArtefactsCanonicalizerTest` (3), `TrustedCertificatesTest` (4): the `sv1` and `op1` golden strings and their escaping, and the key fingerprint. `HttpModeContextLoadsTest` (1), `DefaultProfileHardeningDefaultsTest` (1), `DevProfileHardeningDefaultsTest` (1): the hardened configuration loads; by default a signed verdict is required and the replay record is in memory; the `dev` profile does not require a signed verdict.
+
+Added in 1.7.0 for mutation testing: `ReplayGuardDurabilityTest` (8; the directory sync of a new journal, a sync per commit, the truncation of an incomplete record, a journal longer than one read, the lock released when opening fails, every commit denied after a failed write, printable ASCII lines), `HttpPaymentNetworkClientConnectionTest` (6; one uncached GET with the configured timeouts, no redirects and a JSON `Accept`, which stream each status is read from and that it is drained and closed, disconnection after a failure, the body limit at its boundary, the percent-encoding), `VerdictVerifierTest` (4; the request fields and their echoes in a signed verdict, a blank signature field counted as missing) and `SignedStatementVerifierTest` (3; the signature value's presence, length and base64 before it is verified).
+
+**Mutation testing.** `mvn -B -Ppit test-compile org.pitest:pitest-maven:mutationCoverage -Dpit.threads=$(getconf _NPROCESSORS_ONLN)` runs PIT (1.30.1 since 1.7.0) with the JUnit 5 plugin over every production class, one worker thread per core (reports in `target/pit-reports/`; without `-Dpit.threads` the profile uses 4, settable since 1.7.0; `getconf _NPROCESSORS_ONLN` works on macOS and Linux). In 1.7.0 every one of the 497 mutants is killed, the code added in 1.7.0 (signed verdicts, the operator client, the replay record) included; in 1.6.0 every one of the 185 mutants was killed. The profile fails below 100 % (`mutationThreshold`). Three mutants of the first run could not be killed because the mutated code behaved identically; the constructs behind them were redundant and are gone: an explicit `Content-Type` that Jackson's converter sets anyway (still asserted by `forwardsExactlyTheFourDataMinimisedFields`), a truncation guard whose boundary returned the same string (`sanitise` now takes `substring(0, min(length, max))`), and an early return for a zero-byte read in the counting stream.
+
+OWASP Dependency-Check runs with the `owasp` profile (`mvn -B -Powasp verify`; not in the default build since 1.6.0); in 1.6.0 it passed without suppressions (`.owasp-suppressions.xml` is empty). Since 1.7.0 the plugin is 13.0.0, which does not run without an NVD API key (dependency-check/DependencyCheck#8715); the `owasp` profile reads it from `NVD_API_KEY`. For 1.7.0 the scan ran on 2026-10-31 with NVD and Sonatype OSS Index (token in `OSS_INDEX_TOKEN`): no finding at CVSS 7 or higher after two Spring Security suppressions in `.owasp-suppressions.xml` (CVE-2026-47838 and CVE-2026-47842, both outside the affected ranges in Spring's advisories), and logback-classic 1.5.38 reports CVE-2026-19880 and CVE-2026-104721 (CVSS 6.3, not applicable: no MDC-based discriminator is configured). The earlier DOMPurify finding inside swagger-ui was resolved by pinning `org.webjars:swagger-ui` (5.34.1 since 1.7.0); Tomcat is no longer overridden, because Spring Boot 4.1.2 manages 11.0.27 (see `CHANGELOG.md`, Dependencies). Swagger UI itself is served only under the `dev` profile.
 
 ---
 
@@ -160,7 +184,12 @@ The following assertions are reproducible by running `mvn -B test`:
 
 | Property | Default | Purpose |
 |---|---|---|
-| `railgate.payment-network.mode` | `in-memory` | Selects the `PaymentNetworkClient` implementation. The in-memory implementation is used by `mvn -B test` and by the reference demonstration flow. Production deployments substitute an HTTP-based client. |
+| `railgate.payment-network.mode` | `in-memory` | Selects the `PaymentNetworkClient` implementation. The in-memory implementation is used by `mvn -B test` and by the reference demonstration flow; `file` for local end-to-end runs; `http` *(1.7.0)* for the operator interface in `api/payment-network-operator.openapi.yaml`. |
+| `railgate.payment-network.base-url`, `allow-insecure-http`, `ssl-bundle`, `connect-timeout`, `read-timeout`, `trusted-keys` *(1.7.0)* | empty, `false`, empty, `PT2S`, `PT5S`, empty | `http` mode: the operator's base URL (`https://`), its mTLS bundle and timeouts, and the PEM of its signing certificates (required). |
+| `railgate.gatekeeper.trusted-keys` *(1.7.0)* | empty | PEM of the gatekeeper's verdict-signing certificates (the one `/v1/gatekeeper/keys` publishes). |
+| `railgate.gatekeeper.require-signed-verdict` *(1.7.0)* | `true` (`false` in `dev`) | Require a signed verdict. |
+| `railgate.gatekeeper.verdict-max-skew` *(1.7.0)* | `PT60S` | Accepted distance between `verifiedAt` and railgate's clock. |
+| `railgate.replay.path` *(1.7.0)* | empty | Journal of allowed references; empty means in memory only. |
 | `railgate.gatekeeper.base-url` | `https://localhost:8443` | URL of the supervisor's gatekeeper instance. Must be `https://`; `GatekeeperClient` throws `IllegalStateException` at start-up otherwise. |
 | `railgate.gatekeeper.allow-insecure-http` | `false` | Permits a non-`https` base URL for a local development run. Logs a WARN at every start-up when set. |
 | `railgate.gatekeeper.connect-timeout` | `PT2S` | TCP connect timeout for gatekeeper calls. |
@@ -172,9 +201,17 @@ The following assertions are reproducible by running `mvn -B test`:
 
 ## Known limitations and their scope
 
-### `InMemoryPaymentNetworkClient` is not a real payment-network operator (Critical for production)
+### No payment-network operator offers the artefact interface (Critical for production)
 
-The reference implementation registers signature artefacts in an in-memory map. A production deployment must implement an HTTP-based client against Getswish AB's signature-retrieval endpoint (or the equivalent for other jurisdictions) and replace the in-memory adapter via the `railgate.payment-network.mode` property.
+Since 1.7.0 the interface is specified (`api/payment-network-operator.openapi.yaml`) and railgate's `http` mode implements the client, with the operator's `op1` signature verified under pinned keys. No operator, Getswish AB included, offers the endpoint today, the client has been tested only against a reference operator, and which field of Swish's payout API corresponds to `payoutInstructionId` is not established. Until an operator offers it, a deployment has only the in-memory (code-filled) and file (local, unprotected) modes. The operator's signature makes it accountable for its answer; it does not show that the artefacts are the ones the bank submitted.
+
+### The replay record is per instance (Medium)
+
+`ReplayGuard` refuses a second allow for a reference or payout instruction id within one railgate instance and its journal. It is not shared across instances, is lost on restart without `railgate.replay.path`, is never pruned, is not tamper-evident, and has no release for a settlement that fails downstream after `ALLOWED`.
+
+### Verdict binding has no nonce (Low)
+
+`sv1` binds the verdict to the request's serial, issuer and digest and to the gatekeeper's audit entry, but carries no per-call nonce, so a genuine verdict for an identical request can be presented again within `railgate.gatekeeper.verdict-max-skew`. The validity and revocation of the pinned gatekeeper and operator certificates are not checked.
 
 ### `SettlementRequest` is an abstraction, not a pacs.008 parser (High for production)
 
@@ -211,9 +248,10 @@ Railgate is operated by the central-bank settlement-rail operator (Sveriges Riks
 
 For a production deployment, the following extension points must be addressed:
 
-1. **`PaymentNetworkClient` HTTP implementation** — replace `InMemoryPaymentNetworkClient` with an HTTP client that calls Getswish AB's (or equivalent's) signature-retrieval endpoint. Set `railgate.payment-network.mode` to a non-default value and provide a Spring bean that implements `PaymentNetworkClient`.
+1. **Payment-network operator** — since 1.7.0 the client is `railgate.payment-network.mode=http` against the interface in `api/payment-network-operator.openapi.yaml`; what remains is an operator that offers it (a participation condition), its signing certificate in `railgate.payment-network.trusted-keys`, and an mTLS client certificate in `railgate.payment-network.ssl-bundle`. An operator with a different interface needs its own `PaymentNetworkClient` bean.
 2. **pacs.008 ingress** — wire the `SettlementController.precheck` endpoint into the central-bank settlement pipeline. The pipeline must extract the seven fields modelled by `SettlementRequest` from the incoming pacs.008 and synchronously block the settlement based on the orchestrator's response. Both party-type flags are required; omitting them is a 400, not a pass-through.
-3. **mTLS configuration** — production deployments require mTLS in both directions. *Outbound:* railgate → gatekeeper, where the `SETTLEMENT_RAIL` role authorises the call to `/api/v1/verify`; define the truststore and client key as a Spring Boot SSL bundle and name it in `railgate.gatekeeper.ssl-bundle`. *Inbound:* settlement rail → railgate, where `SecurityConfig`'s `/api/v1/**` chain ships HTTP Basic and the deployer substitutes `.x509(...)` together with `server.ssl.client-auth=need`. Note that railgate does not verify a signature over the gatekeeper's verdict, so the outbound TLS configuration is load-bearing rather than defence in depth.
+3. **mTLS configuration** — production deployments require mTLS in both directions. *Outbound:* railgate → gatekeeper, where the `SETTLEMENT_RAIL` role authorises the call to `/api/v1/verify`; define the truststore and client key as a Spring Boot SSL bundle and name it in `railgate.gatekeeper.ssl-bundle`. *Inbound:* settlement rail → railgate, where `SecurityConfig`'s `/api/v1/**` chain ships HTTP Basic and the deployer substitutes `.x509(...)` together with `server.ssl.client-auth=need`. Since 1.7.0 railgate also verifies the gatekeeper's signed verdict, which needs the gatekeeper's verdict-signing certificate in `railgate.gatekeeper.trusted-keys`; the outbound TLS configuration still protects the confidentiality of the request and the authentication of railgate to the gatekeeper.
+5. **Shared replay record** — for several railgate instances, back `ReplayGuard` with a store they share, with a defined release for settlements that fail downstream.
 4. **Persistent audit log** — the `RailgateAuditLog` reference uses an in-memory list. Production deployments must back this with a tamper-evident persistent log (a hash-chained append-only file in the manner of `AppendOnlyFileAuditLog` in the gatekeeper repo would be a suitable starting point).
 
 ---

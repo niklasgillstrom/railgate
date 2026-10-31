@@ -23,12 +23,27 @@ import java.util.Optional;
  * is denied as {@code DECLARED_CERT_MISMATCH}. Without a declared serial,
  * railgate verifies what the operator returns and nothing else.
  *
- * <p>Nor does the lookup bind the artefacts to one settlement. railgate does
- * not record which transaction references it has already allowed, so a
- * settlement that reuses the reference of an earlier, genuinely signed
- * payout receives that payout's artefacts and verifies. Whether a reference
- * can settle twice is left to the settlement rail's own duplicate checks;
- * railgate does not detect it.
+ * <p><b>Authenticity of the operator's answer.</b> Three implementations
+ * exist. {@link HttpPaymentNetworkClient} ({@code mode=http}) calls the
+ * operator interface specified in
+ * {@code api/payment-network-operator.openapi.yaml}, over mTLS, and accepts an
+ * answer only when the operator's {@code op1} signature over it verifies under
+ * a pinned operator certificate, the algorithm is allow-listed and the echoed
+ * transaction reference is the one requested; otherwise the settlement is
+ * denied with {@code OPERATOR_SIGNATURE_INVALID}. The signature makes the
+ * operator accountable for what it returned; it does not make a false answer
+ * from the operator detectable. {@link InMemoryPaymentNetworkClient} and
+ * {@link FilePaymentNetworkClient} perform no such check, and whoever fills
+ * them controls the artefacts. No operator offers this interface today; it is
+ * specified so that it can be required of one.
+ *
+ * <p><b>Reuse of a transaction reference.</b> The lookup itself does not bind
+ * the artefacts to one settlement. {@code SettlementOrchestrator} does: it
+ * records the transaction reference (and, in {@code http} mode, the operator's
+ * {@code payoutInstructionId}) of every {@code ALLOWED} settlement in
+ * {@code ReplayGuard} and denies a later settlement that carries either with
+ * {@code REFERENCE_ALREADY_SETTLED}. That record is local to one railgate
+ * instance and its journal.
  *
  * <p>The implementation lookup is by {@code transactionReference} (typically
  * pacs.008 EndToEndId or UETR), which the payment-network operator already
@@ -42,7 +57,23 @@ public interface PaymentNetworkClient {
      * @param transactionReference end-to-end transaction reference (UETR
      *     or EndToEndId)
      * @return signature artefacts if found, empty if no matching transaction
-     *     was registered with the payment-network operator
+     *     was registered with the payment-network operator, or (for
+     *     {@link HttpPaymentNetworkClient}) if the operator could not be
+     *     reached or its answer did not verify
      */
     Optional<PaymentSignature> getSignature(String transactionReference);
+
+    /**
+     * Retrieve the artefacts and say why when there are none.
+     *
+     * <p>The orchestrator calls this method. The default wraps
+     * {@link #getSignature}, which can only report found or not found;
+     * {@link HttpPaymentNetworkClient} overrides it to report an unreachable
+     * operator and an unauthenticated answer separately.
+     */
+    default PaymentNetworkLookup lookup(String transactionReference) {
+        return getSignature(transactionReference)
+                .<PaymentNetworkLookup>map(PaymentNetworkLookup.Found::new)
+                .orElseGet(PaymentNetworkLookup.NotFound::new);
+    }
 }
