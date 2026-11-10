@@ -35,11 +35,20 @@ abstract: >-
   for retrieving payout artefacts from the payment-network operator (which
   no operator offers yet), and allows each transaction reference and
   payout instruction id at most once; PIT kills every mutant of the
-  1.7.0 code as well. Data-minimised by design: only digest, signature, and
+  1.7.0 code as well.
+  Version 1.8.0 makes the corrections that followed a further review of the
+  code: requests without credentials no longer create server sessions, an
+  exchange with the gatekeeper or the operator is timed out as a whole, an
+  answer from the gatekeeper other than 2xx is not read as a verdict, a
+  replay record whose write or sync fails is cut off again so that a denied
+  settlement does not count as settled after a restart, and a request that
+  does not accept JSON is answered before it is evaluated; PIT kills every
+  mutant of the 1.8.0 code as well.
+  Data-minimised by design: only digest, signature, and
   certificate identifiers traverse the supervisory chain — no transaction
   payload content is exposed to the supervisor.
-version: "1.7.0"
-date-released: "2026-10-31"
+version: "1.8.0"
+date-released: "2026-11-10"
 license: MIT
 repository-code: "https://github.com/niklasgillstrom/railgate"
 authors:

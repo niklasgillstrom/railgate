@@ -93,7 +93,7 @@ public class RailgateAuditLog {
      * arrive in its response and were retained, for up to
      * {@code MAX_ENTRIES} entries, at whatever length it sent.
      */
-    static final int MAX_FIELD_LENGTH = 128;
+    public static final int MAX_FIELD_LENGTH = 128;
 
     private final Deque<AuditEntry> entries = new ConcurrentLinkedDeque<>();
     private final AtomicInteger entryCount = new AtomicInteger();

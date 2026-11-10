@@ -8,13 +8,20 @@ import java.nio.channels.FileLock;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.WritableByteChannel;
 
-/** A file channel that counts {@code force} calls and can fail reads or writes; everything else is delegated. */
+/**
+ * A file channel that counts {@code force} calls and can fail reads, writes, syncs or truncations; everything
+ * else is delegated.
+ */
 final class RecordingChannel extends FileChannel {
 
     private final FileChannel delegate;
     int forces;
     IOException failRead;
     IOException failWrite;
+    /** Thrown by the next {@code force}, once, after the bytes written so far have reached the file. */
+    IOException failNextForce;
+    IOException failTruncate;
+    int truncations;
 
     RecordingChannel(FileChannel delegate) {
         this.delegate = delegate;
@@ -64,12 +71,21 @@ final class RecordingChannel extends FileChannel {
 
     @Override
     public FileChannel truncate(long size) throws IOException {
+        if (failTruncate != null) {
+            throw failTruncate;
+        }
+        truncations++;
         delegate.truncate(size);
         return this;
     }
 
     @Override
     public void force(boolean metaData) throws IOException {
+        if (failNextForce != null) {
+            IOException failure = failNextForce;
+            failNextForce = null;
+            throw failure;
+        }
         forces++;
         delegate.force(metaData);
     }

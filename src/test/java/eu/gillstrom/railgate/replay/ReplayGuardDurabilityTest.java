@@ -164,7 +164,7 @@ class ReplayGuardDurabilityTest {
         ReplayGuard guard = new ReplayGuard(journal().toString(), opener);
         assertThatThrownBy(() -> guard.commit(reserve(guard, "TX-1", null)))
                 .isInstanceOf(ReplayJournalException.class)
-                .hasMessageEndingWith(" could not be written");
+                .hasMessageEndingWith(" could not be written; the record was removed again");
         assertThatThrownBy(() -> guard.commit(reserve(guard, "TX-2", null)))
                 .isInstanceOf(ReplayJournalException.class)
                 .hasMessageEndingWith(" failed earlier; restart railgate to recover it");
@@ -172,6 +172,75 @@ class ReplayGuardDurabilityTest {
         assertThatThrownBy(() -> guard.commit(reserve(guard, "TX-3", null)))
                 .isInstanceOf(ReplayJournalException.class)
                 .hasMessageEndingWith(" is closed");
+    }
+
+    /**
+     * The settlement whose record could not be synced is denied. Until 1.7.0
+     * the complete line stayed in the file, and after a restart the denied
+     * settlement counted as allowed.
+     */
+    @Test
+    void aRecordWhoseSyncFailedIsCutOffAgainAndIsNotSettledAfterARestart() throws Exception {
+        ReplayGuard guard = new ReplayGuard(journal().toString(), opener);
+        guard.commit(reserve(guard, "TX-KEPT", "PAYOUT-KEPT"));
+        long sizeBefore = Files.size(journal());
+        RecordingChannel channel = journals.get(0);
+        int forcesBefore = channel.forces;
+
+        channel.failNextForce = new IOException("fsync failed");
+        ReplayGuard.Reservation denied = reserve(guard, "TX-DENIED", "PAYOUT-DENIED");
+        assertThatThrownBy(() -> guard.commit(denied))
+                .isInstanceOf(ReplayJournalException.class)
+                .hasMessage("replay journal " + journal() + " could not be written; the record was removed again")
+                .hasCauseInstanceOf(IOException.class);
+
+        assertThat(channel.truncations).isEqualTo(1);
+        assertThat(channel.forces).as("the truncation is synced").isEqualTo(forcesBefore + 1);
+        assertThat(Files.size(journal())).isEqualTo(sizeBefore);
+        assertThat(guard.isSettled("TX-DENIED")).isFalse();
+        assertThat(messages(Level.ERROR)).singleElement().asString()
+                .contains("could not be written; the record was removed again.");
+        guard.release(denied);
+        guard.close();
+
+        try (ReplayGuard restarted = new ReplayGuard(journal().toString())) {
+            assertThat(restarted.isSettled("TX-KEPT")).isTrue();
+            assertThat(restarted.isSettled("TX-DENIED")).as("a denied settlement is not allowed by a restart").isFalse();
+            assertThat(restarted.isPayoutInstructionSettled("PAYOUT-DENIED")).isFalse();
+            assertThat(restarted.settledCount()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void theFirstRecordOfANewJournalIsCutOffTheSameWay() throws Exception {
+        ReplayGuard guard = new ReplayGuard(journal().toString(), opener);
+        journals.get(0).failNextForce = new IOException("fsync failed");
+
+        assertThatThrownBy(() -> guard.commit(reserve(guard, "TX-FIRST", null)))
+                .hasMessageEndingWith("the record was removed again");
+
+        assertThat(Files.size(journal())).isZero();
+        guard.close();
+    }
+
+    @Test
+    void whenTheRecordCannotBeCutOffEitherTheErrorSaysWhereToCutTheFile() throws Exception {
+        ReplayGuard guard = new ReplayGuard(journal().toString(), opener);
+        guard.commit(reserve(guard, "TX-KEPT", null));
+        long sizeBefore = Files.size(journal());
+        RecordingChannel channel = journals.get(0);
+
+        channel.failNextForce = new IOException("fsync failed");
+        channel.failTruncate = new IOException("read-only file system");
+        String state = "THE RECORD MAY STILL BE IN THE FILE: truncate it to " + sizeBefore
+                + " bytes before restarting, or the denied settlement counts as allowed";
+        assertThatThrownBy(() -> guard.commit(reserve(guard, "TX-DENIED", null)))
+                .isInstanceOf(ReplayJournalException.class)
+                .hasMessage("replay journal " + journal() + " could not be written; " + state);
+
+        assertThat(messages(Level.ERROR)).singleElement().asString().contains(state);
+        assertThat(Files.size(journal())).as("the record is still there").isGreaterThan(sizeBefore);
+        guard.close();
     }
 
     @Test

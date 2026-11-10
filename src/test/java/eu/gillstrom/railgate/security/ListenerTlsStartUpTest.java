@@ -56,7 +56,7 @@ class ListenerTlsStartUpTest {
             assertThat(connection.getResponseCode()).as("TLS handshake done, Basic auth required").isEqualTo(401);
             assertThat(connection.getCipherSuite()).isNotBlank();
 
-            // Outside /api/v1 the default chain still requires a login.
+            // Outside /api/v1 the same chain applies: credentials are required.
             HttpsURLConnection outside = (HttpsURLConnection) URI.create(
                     "https://localhost:" + port + "/").toURL().openConnection(java.net.Proxy.NO_PROXY);
             outside.setSSLSocketFactory(ssl.getSocketFactory());

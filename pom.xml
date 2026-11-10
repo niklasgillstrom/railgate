@@ -13,7 +13,7 @@
 
     <groupId>eu.gillstrom</groupId>
     <artifactId>railgate</artifactId>
-    <version>1.7.0</version>
+    <version>1.8.0</version>
     <name>DORA Settlement-Layer Attestation Gate</name>
     <description>
         Settlement-rail enforcement component for DORA-compliant payment
@@ -251,7 +251,7 @@
         </profile>
         <profile>
             <!--
-                Mutation testing with PIT: mvn -Ppit test-compile org.pitest:pitest-maven:mutationCoverage
+                Mutation testing with PIT: mvn -Ppit clean test-compile org.pitest:pitest-maven:mutationCoverage
                 Reports are written to target/pit-reports/.
             -->
             <id>pit</id>
@@ -260,7 +260,7 @@
                     <plugin>
                         <groupId>org.pitest</groupId>
                         <artifactId>pitest-maven</artifactId>
-                        <version>1.30.1</version>
+                        <version>1.30.2</version>
                         <dependencies>
                             <dependency>
                                 <groupId>org.pitest</groupId>
@@ -276,7 +276,7 @@
                                 <param>eu.gillstrom.railgate.*</param>
                             </targetTests>
                             <threads>${pit.threads}</threads>
-                            <!-- Every mutant is killed in 1.7.0 (497 of 497; PEER_REVIEW_GUIDE.md). -->
+                            <!-- Every mutant is detected; the counts of each release are in PEER_REVIEW_GUIDE.md. -->
                             <mutationThreshold>100</mutationThreshold>
                             <timestampedReports>false</timestampedReports>
                             <outputFormats>

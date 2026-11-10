@@ -8,21 +8,23 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.ssl.SslBundle;
 import org.springframework.boot.ssl.SslBundles;
 import org.springframework.http.HttpEntity;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.ClientHttpResponse;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResponseErrorHandler;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLSocketFactory;
 import javax.security.auth.x500.X500Principal;
 import java.io.IOException;
-import java.net.HttpURLConnection;
+import java.io.InputStream;
+import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Base64;
@@ -41,10 +43,15 @@ import java.util.regex.Pattern;
  * <p>railgate never sends transaction payload content. Only the digest is
  * transmitted; the supervisor never sees transaction content.
  *
- * <p>Connection failures and non-2xx responses translate to a
- * {@link VerificationResult} with {@code reason = "NETWORK_ERROR"} so that
- * the orchestrator can apply default-deny without conflating crypto failure
- * with infrastructure failure.
+ * <p>Connection failures, an answer that is not complete within
+ * {@code railgate.gatekeeper.read-timeout}, an answer larger than
+ * {@value #MAX_RESPONSE_BYTES} bytes and every status other than 2xx
+ * translate to a {@link VerificationResult} with
+ * {@code reason = "NETWORK_ERROR"} so that the orchestrator can apply
+ * default-deny without conflating crypto failure with infrastructure failure.
+ * Until 1.7.0 only 4xx and 5xx statuses did: the body of a 3xx answer was read
+ * as a verdict, the answer had no size limit, and the read timeout bounded
+ * each read rather than the answer ({@link OutboundHttp}).
  *
  * <p><b>Signed verdicts.</b> Every verdict is passed to a
  * {@link VerdictVerifier}. With {@code railgate.gatekeeper.require-signed-verdict=true}
@@ -83,6 +90,9 @@ public class GatekeeperClient {
 
     private static final int MAX_LOGGED_ERROR_LENGTH = 512;
 
+    /** Bound on the gatekeeper's answer; a signed verdict is under 4 KB. */
+    static final int MAX_RESPONSE_BYTES = 64 * 1024;
+
     private final RestTemplate restTemplate;
 
     private final VerdictVerifier verdictVerifier;
@@ -99,7 +109,11 @@ public class GatekeeperClient {
      * forever. That is not fail-open — the transaction is never allowed — but
      * it is not fail-closed either: the settlement pipeline stalls instead of
      * receiving a deny. Bounded timeouts turn that case into the
-     * {@code NETWORK_ERROR} deny the design already describes.</p>
+     * {@code NETWORK_ERROR} deny the design already describes.
+     * {@code connect-timeout} bounds the connect. {@code read-timeout} bounds
+     * everything after it, up to the last byte of the answer; until 1.7.0 it
+     * bounded each read, so an answer arriving a byte at a time was not
+     * bounded at all. Both must be greater than zero.</p>
      *
      * <p>The base URL is a constructor argument rather than an injected field
      * because the scheme check below has to run at start-up. A field would be
@@ -123,10 +137,10 @@ public class GatekeeperClient {
      *
      * @throws IllegalStateException when the base URL is not {@code https://}
      *     and {@code railgate.gatekeeper.allow-insecure-http} has not been
-     *     set to {@code true}, when the named SSL bundle sets ciphers or
-     *     enabled protocols, which {@code HttpURLConnection} cannot apply,
-     *     when {@code railgate.gatekeeper.trusted-keys} is set but cannot be
-     *     read or holds no certificate, or when
+     *     set to {@code true}, when a timeout is not positive, when the
+     *     named SSL bundle sets ciphers or enabled protocols, which railgate
+     *     does not apply, when {@code railgate.gatekeeper.trusted-keys} is set
+     *     but cannot be read or holds no certificate, or when
      *     {@code railgate.gatekeeper.verdict-max-skew} is negative
      * @throws org.springframework.boot.ssl.NoSuchSslBundleException when
      *     {@code railgate.gatekeeper.ssl-bundle} names no configured bundle
@@ -206,39 +220,71 @@ public class GatekeeperClient {
 
         this.gatekeeperBaseUrl = baseUrl;
 
-        SimpleClientHttpRequestFactory factory = requestFactory(sslBundle, sslBundles);
-        factory.setConnectTimeout(connectTimeout);
-        factory.setReadTimeout(readTimeout);
-        this.restTemplate = new RestTemplate(factory);
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(OutboundHttp.client(
+                OutboundHttp.positive(connectTimeout, "railgate.gatekeeper.connect-timeout"),
+                OutboundHttp.sslContext("railgate.gatekeeper.ssl-bundle", sslBundle, sslBundles)));
+        // Spring cancels the exchange, or closes the body it is reading, when
+        // this time has passed since the request was sent.
+        factory.setReadTimeout(OutboundHttp.positive(readTimeout, "railgate.gatekeeper.read-timeout"));
+        this.restTemplate = guarded(new RestTemplate(factory));
     }
 
-    private static SimpleClientHttpRequestFactory requestFactory(String sslBundle, SslBundles sslBundles) {
-        if (sslBundle == null || sslBundle.isBlank()) {
-            return new SimpleClientHttpRequestFactory();
-        }
-        String bundleName = sslBundle.trim();
-        if (sslBundles == null) {
-            throw new IllegalStateException("railgate.gatekeeper.ssl-bundle is '" + bundleName
-                    + "' but no SSL bundle registry is available.");
-        }
-        SslBundle bundle = sslBundles.getBundle(bundleName);
-        if (bundle.getOptions() != null && bundle.getOptions().isSpecified()) {
-            throw new IllegalStateException("SSL bundle '" + bundleName + "' sets ciphers or "
-                    + "enabled protocols. The gatekeeper connection uses HttpURLConnection, "
-                    + "which cannot apply them; remove the bundle's options or use a bundle "
-                    + "without them.");
-        }
-        SSLSocketFactory socketFactory = bundle.createSslContext().getSocketFactory();
-        return new SimpleClientHttpRequestFactory() {
+    /**
+     * Every status other than 2xx is an error whose body is not read, and at
+     * most {@value #MAX_RESPONSE_BYTES} bytes of a 2xx body are read.
+     * {@code RestTemplate}'s default treats only 4xx and 5xx as errors, so the
+     * body of a 3xx answer was deserialised as a verdict.
+     */
+    private static RestTemplate guarded(RestTemplate restTemplate) {
+        restTemplate.setErrorHandler(new ResponseErrorHandler() {
             @Override
-            protected void prepareConnection(HttpURLConnection connection, String httpMethod)
-                    throws IOException {
-                super.prepareConnection(connection, httpMethod);
-                if (connection instanceof HttpsURLConnection httpsConnection) {
-                    httpsConnection.setSSLSocketFactory(socketFactory);
-                }
+            public boolean hasError(ClientHttpResponse response) throws IOException {
+                return !response.getStatusCode().is2xxSuccessful();
             }
-        };
+
+            @Override
+            public void handleError(URI url, HttpMethod method, ClientHttpResponse response) throws IOException {
+                throw new RestClientException("the gatekeeper answered HTTP " + response.getStatusCode().value());
+            }
+        });
+        restTemplate.getInterceptors().add((request, body, execution) ->
+                new BoundedResponse(execution.execute(request, body)));
+        return restTemplate;
+    }
+
+    /** The gatekeeper's response with its body bounded. */
+    static final class BoundedResponse implements ClientHttpResponse {
+
+        private final ClientHttpResponse response;
+
+        BoundedResponse(ClientHttpResponse response) {
+            this.response = response;
+        }
+
+        @Override
+        public HttpStatusCode getStatusCode() throws IOException {
+            return response.getStatusCode();
+        }
+
+        @Override
+        public String getStatusText() throws IOException {
+            return response.getStatusText();
+        }
+
+        @Override
+        public HttpHeaders getHeaders() {
+            return response.getHeaders();
+        }
+
+        @Override
+        public InputStream getBody() throws IOException {
+            return new OutboundHttp.BoundedInputStream(response.getBody(), MAX_RESPONSE_BYTES);
+        }
+
+        @Override
+        public void close() {
+            response.close();
+        }
     }
 
     /**
@@ -251,7 +297,7 @@ public class GatekeeperClient {
 
     /** For tests: a RestTemplate and the verdict verifier to apply. */
     GatekeeperClient(RestTemplate restTemplate, VerdictVerifier verdictVerifier) {
-        this.restTemplate = restTemplate;
+        this.restTemplate = guarded(restTemplate);
         this.verdictVerifier = java.util.Objects.requireNonNull(verdictVerifier, "verdictVerifier");
     }
 

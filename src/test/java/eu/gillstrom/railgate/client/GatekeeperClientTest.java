@@ -5,24 +5,35 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import eu.gillstrom.railgate.model.PaymentSignature;
 import eu.gillstrom.railgate.model.VerificationResult;
+import eu.gillstrom.railgate.testsupport.SilentServer;
+import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.ssl.NoSuchSslBundleException;
 import org.springframework.boot.ssl.SslBundle;
 import org.springframework.boot.ssl.SslBundles;
 import org.springframework.boot.ssl.SslOptions;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
-import org.springframework.http.client.ClientHttpRequest;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestTemplate;
 
-import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.net.URI;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.http.HttpClient;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 
@@ -38,6 +49,7 @@ import static org.springframework.test.web.client.match.MockRestRequestMatchers.
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withServerError;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
 /**
@@ -417,8 +429,7 @@ class GatekeeperClientTest {
                 Duration.ofSeconds(5),
                 false);
 
-        assertThat(connectionOf(plain).getSSLSocketFactory())
-                .isSameAs(HttpsURLConnection.getDefaultSSLSocketFactory());
+        assertThat(httpClientOf(plain).sslContext()).isSameAs(SSLContext.getDefault());
     }
 
     @Test
@@ -427,9 +438,16 @@ class GatekeeperClientTest {
         // answers would hold the settlement indefinitely.
         GatekeeperClient plain = new GatekeeperClient(
                 "https://gatekeeper.test:8443", Duration.ofMillis(1234), Duration.ofMillis(4321), false);
-        HttpsURLConnection connection = connectionOf(plain);
-        assertThat(connection.getConnectTimeout()).isEqualTo(1234);
-        assertThat(connection.getReadTimeout()).isEqualTo(4321);
+        assertThat(httpClientOf(plain).connectTimeout()).contains(Duration.ofMillis(1234));
+        assertThat(readTimeoutOf(plain)).isEqualTo(Duration.ofMillis(4321));
+    }
+
+    @Test
+    void theGatekeeperConnectionIsHttp11AndFollowsNoRedirect() throws Exception {
+        GatekeeperClient plain = new GatekeeperClient(
+                "https://gatekeeper.test:8443", Duration.ofSeconds(2), Duration.ofSeconds(5), false);
+        assertThat(httpClientOf(plain).followRedirects()).isEqualTo(HttpClient.Redirect.NEVER);
+        assertThat(httpClientOf(plain).version()).isEqualTo(HttpClient.Version.HTTP_1_1);
     }
 
     @Test
@@ -445,8 +463,7 @@ class GatekeeperClientTest {
                 bundles);
 
         verifyNoInteractions(bundles);
-        assertThat(connectionOf(plain).getSSLSocketFactory())
-                .isSameAs(HttpsURLConnection.getDefaultSSLSocketFactory());
+        assertThat(httpClientOf(plain).sslContext()).isSameAs(SSLContext.getDefault());
     }
 
     @Test
@@ -469,11 +486,22 @@ class GatekeeperClientTest {
 
         verify(bundles).getBundle("gatekeeper");
         verify(bundle).createSslContext();
-        assertThat(connectionOf(withBundle).getSSLSocketFactory())
-                .isNotNull()
-                .isNotSameAs(HttpsURLConnection.getDefaultSSLSocketFactory());
-        assertThat(connectionOf(withBundle).getReadTimeout()).as("the bundle keeps the timeouts").isEqualTo(5000);
-        assertThat(connectionOf(withBundle).getConnectTimeout()).isEqualTo(2000);
+        assertThat(httpClientOf(withBundle).sslContext()).isSameAs(sslContext);
+        assertThat(readTimeoutOf(withBundle)).as("the bundle keeps the timeouts").isEqualTo(Duration.ofSeconds(5));
+        assertThat(httpClientOf(withBundle).connectTimeout()).contains(Duration.ofSeconds(2));
+    }
+
+    @Test
+    void aBundleNameWithoutARegistryFailsAtStartUp() {
+        assertThatThrownBy(() -> new GatekeeperClient(
+                        "https://gatekeeper.test:8443",
+                        Duration.ofSeconds(2),
+                        Duration.ofSeconds(5),
+                        false,
+                        " gatekeeper ",
+                        null))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("railgate.gatekeeper.ssl-bundle is 'gatekeeper' but no SSL bundle registry is available.");
     }
 
     @Test
@@ -508,14 +536,221 @@ class GatekeeperClientTest {
                         "gatekeeper",
                         bundles))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("gatekeeper");
+                .hasMessage("SSL bundle 'gatekeeper' (railgate.gatekeeper.ssl-bundle) sets ciphers or enabled "
+                        + "protocols. railgate does not apply them to its outbound connections; remove the "
+                        + "bundle's options or use a bundle without them.");
     }
 
-    private static HttpsURLConnection connectionOf(GatekeeperClient client) throws IOException {
+    private static Object requestFactoryOf(GatekeeperClient client) {
         RestTemplate template = (RestTemplate) ReflectionTestUtils.getField(client, "restTemplate");
-        ClientHttpRequest request = template.getRequestFactory()
-                .createRequest(URI.create("https://gatekeeper.test:8443/api/v1/verify"), HttpMethod.POST);
-        return (HttpsURLConnection) ReflectionTestUtils.getField(request, "connection");
+        return ReflectionTestUtils.getField(template, "requestFactory");
+    }
+
+    private static HttpClient httpClientOf(GatekeeperClient client) {
+        return (HttpClient) ReflectionTestUtils.getField(requestFactoryOf(client), "httpClient");
+    }
+
+    private static Duration readTimeoutOf(GatekeeperClient client) {
+        return (Duration) ReflectionTestUtils.getField(requestFactoryOf(client), "readTimeout");
+    }
+
+    // ---------------------------------------------------------------
+    // Status, duration and size of the answer (1.8.0)
+    // ---------------------------------------------------------------
+
+    private static final String ALLOWING_VERDICT =
+            "{\"signatureValid\":true,\"compliant\":true,\"auditEntryId\":\"AE-1\",\"reason\":\"OK\"}";
+
+    /**
+     * Until 1.7.0 only 4xx and 5xx were errors, and the body of a 3xx answer
+     * was read as the verdict.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {300, 301, 302, 303, 307, 308, 100, 199, 400, 404, 503})
+    void anAllowingBodyUnderAnyStatusOtherThan2xxIsADeny(int status) {
+        server.expect(requestTo(VERIFY_URL)).andRespond(
+                withStatus(HttpStatusCode.valueOf(status)).contentType(MediaType.APPLICATION_JSON)
+                        .body(ALLOWING_VERDICT));
+
+        VerificationResult result = client.verify(signature());
+
+        assertThat(result.getReason()).as("HTTP " + status).isEqualTo("NETWORK_ERROR");
+        assertThat(result.isSignatureValid()).isFalse();
+        assertThat(result.isCompliant()).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {200, 201, 299})
+    void aVerdictUnderA2xxStatusIsRead(int status) {
+        server.expect(requestTo(VERIFY_URL)).andRespond(
+                withStatus(HttpStatusCode.valueOf(status)).contentType(MediaType.APPLICATION_JSON)
+                        .body(ALLOWING_VERDICT));
+
+        VerificationResult result = client.verify(signature());
+
+        assertThat(result.getReason()).as("HTTP " + status).isEqualTo("OK");
+        assertThat(result.isSignatureValid()).isTrue();
+    }
+
+    @Test
+    void theStatusOfARefusedAnswerIsLoggedAndItsBodyIsNot() {
+        Logger logger = (Logger) LoggerFactory.getLogger(GatekeeperClient.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            server.expect(requestTo(VERIFY_URL)).andRespond(
+                    withStatus(HttpStatus.FOUND).contentType(MediaType.APPLICATION_JSON).body(ALLOWING_VERDICT));
+
+            client.verify(signature());
+
+            assertThat(appender.list).singleElement().satisfies(event ->
+                    assertThat(event.getFormattedMessage())
+                            .isEqualTo("Gatekeeper unreachable for cert 0123456789: the gatekeeper answered HTTP 302"));
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
+    @Test
+    void aTimeoutThatIsNotPositiveIsRefusedAtStartUp() {
+        Duration ok = Duration.ofSeconds(2);
+        for (Duration refused : new Duration[] {null, Duration.ZERO, Duration.ofSeconds(-1)}) {
+            assertThatThrownBy(() -> new GatekeeperClient("https://gatekeeper.test:8443", refused, ok, false))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("railgate.gatekeeper.connect-timeout must be a positive duration");
+            assertThatThrownBy(() -> new GatekeeperClient("https://gatekeeper.test:8443", ok, refused, false))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("railgate.gatekeeper.read-timeout must be a positive duration");
+        }
+    }
+
+    private static GatekeeperClient clientFor(String baseUrl, Duration readTimeout) {
+        return new GatekeeperClient(baseUrl, Duration.ofSeconds(2), readTimeout, true);
+    }
+
+    /**
+     * Until 1.7.0 the read timeout bounded each read, so a gatekeeper that
+     * sent a byte before each one expired was not bounded at all.
+     */
+    @Test
+    void anAnswerThatArrivesAByteAtATimeEndsInADenyWhenTheReadTimeoutIsUp() throws Exception {
+        try (SilentServer dripping = SilentServer.dripping(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 60000\r\n\r\n", 50)) {
+            GatekeeperClient client = clientFor(dripping.baseUrl(), Duration.ofMillis(500));
+
+            long started = System.nanoTime();
+            VerificationResult result = client.verify(signature());
+            long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+
+            assertThat(result.getReason()).isEqualTo("NETWORK_ERROR");
+            assertThat(elapsedMillis).as("the bytes kept coming for as long as railgate listened")
+                    .isBetween(400L, 10_000L);
+        }
+    }
+
+    @Test
+    void headersThatArriveAByteAtATimeEndInADenyAsWell() throws Exception {
+        try (SilentServer dripping = SilentServer.dripping("HTTP/1.1 200 OK\r\nX-Slow: ", 50)) {
+            GatekeeperClient client = clientFor(dripping.baseUrl(), Duration.ofMillis(500));
+
+            long started = System.nanoTime();
+            VerificationResult result = client.verify(signature());
+            long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+
+            assertThat(result.getReason()).isEqualTo("NETWORK_ERROR");
+            assertThat(elapsedMillis).isBetween(400L, 10_000L);
+        }
+    }
+
+    @Test
+    void aGatekeeperThatAcceptsAndNeverAnswersEndsInADeny() throws Exception {
+        try (SilentServer silent = SilentServer.silent()) {
+            GatekeeperClient client = clientFor(silent.baseUrl(), Duration.ofMillis(500));
+
+            long started = System.nanoTime();
+            VerificationResult result = client.verify(signature());
+            long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+
+            assertThat(result.getReason()).isEqualTo("NETWORK_ERROR");
+            assertThat(elapsedMillis).isBetween(400L, 10_000L);
+        }
+    }
+
+    @Test
+    void anAnswerLargerThanTheLimitIsADenyAndOneWithinItIsRead() throws Exception {
+        String padding = " ".repeat(GatekeeperClient.MAX_RESPONSE_BYTES - ALLOWING_VERDICT.length());
+        byte[][] bodies = {
+                (ALLOWING_VERDICT + padding).getBytes(StandardCharsets.UTF_8),
+                (ALLOWING_VERDICT + padding + " ").getBytes(StandardCharsets.UTF_8)};
+        String[] expected = {"OK", "NETWORK_ERROR"};
+
+        for (int i = 0; i < bodies.length; i++) {
+            byte[] body = bodies[i];
+            HttpServer gatekeeper = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            gatekeeper.createContext("/api/v1/verify", exchange -> {
+                try (exchange) {
+                    exchange.getRequestBody().readAllBytes();
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, body.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(body);
+                    }
+                }
+            });
+            gatekeeper.start();
+            try {
+                GatekeeperClient client = clientFor("http://127.0.0.1:" + gatekeeper.getAddress().getPort(),
+                        Duration.ofSeconds(5));
+
+                assertThat(client.verify(signature()).getReason()).as(body.length + " bytes").isEqualTo(expected[i]);
+            } finally {
+                gatekeeper.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void theBoundedResponseIsTheGatekeepersInEveryOtherRespect() throws Exception {
+        HttpHeaders headers = new HttpHeaders();
+        boolean[] closed = {false};
+        ClientHttpResponse answer = new ClientHttpResponse() {
+            @Override
+            public HttpStatusCode getStatusCode() {
+                return HttpStatus.ACCEPTED;
+            }
+
+            @Override
+            public String getStatusText() {
+                return "Accepted";
+            }
+
+            @Override
+            public HttpHeaders getHeaders() {
+                return headers;
+            }
+
+            @Override
+            public InputStream getBody() {
+                return new ByteArrayInputStream(new byte[GatekeeperClient.MAX_RESPONSE_BYTES + 1]);
+            }
+
+            @Override
+            public void close() {
+                closed[0] = true;
+            }
+        };
+        GatekeeperClient.BoundedResponse response = new GatekeeperClient.BoundedResponse(answer);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        assertThat(response.getStatusText()).isEqualTo("Accepted");
+        assertThat(response.getHeaders()).isSameAs(headers);
+        InputStream body = response.getBody();
+        assertThat(body.readNBytes(GatekeeperClient.MAX_RESPONSE_BYTES)).hasSize(GatekeeperClient.MAX_RESPONSE_BYTES);
+        assertThatThrownBy(body::read).isInstanceOf(IOException.class)
+                .hasMessage("the answer exceeds 65536 bytes");
+        response.close();
+        assertThat(closed[0]).isTrue();
     }
 
     private static PaymentSignature.PaymentSignatureBuilder valid() {

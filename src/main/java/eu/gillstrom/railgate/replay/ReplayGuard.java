@@ -58,7 +58,13 @@ import java.util.Set;
  * exclusive {@link FileLock} while railgate runs, so a second railgate process
  * cannot open the same journal. After a write to the journal fails, every
  * further commit fails too, until restart, so that no record is appended after
- * a partial one.</p>
+ * a partial one. A record whose write or sync failed belongs to a settlement
+ * that was denied, so it is cut off again at once: the file is truncated to
+ * where the record began and synced. Until 1.7.0 a complete line whose sync
+ * had failed stayed in the file, and after a restart its reference counted as
+ * settled although the settlement had been refused. If the truncation fails as
+ * well, the ERROR that is logged says so and names the offset the file has to
+ * be cut to before railgate is started again.</p>
  *
  * <p><b>Limits.</b> The record is local to one railgate instance: instances
  * that do not share a journal do not see each other's settlements, and a
@@ -131,6 +137,8 @@ public class ReplayGuard implements AutoCloseable {
     private final ChannelOpener opener;
     private final Path journalPath;
     private final FileChannel journal;
+    /** Length of the journal up to its last record that was written and synced. */
+    private long journalEnd;
     private boolean journalFailed;
     private boolean closed;
 
@@ -177,7 +185,8 @@ public class ReplayGuard implements AutoCloseable {
                 forceDirectory(journalPath.toAbsolutePath().getParent());
             }
             int records = rebuild(channel);
-            channel.position(channel.size());
+            journalEnd = channel.size();
+            channel.position(journalEnd);
             log.info("Replay journal {} opened: {} allowed settlement(s) recorded ({} payout instruction id(s))",
                     journalPath, records, settledPayoutInstructionIds.size());
         } catch (IOException e) {
@@ -310,12 +319,35 @@ public class ReplayGuard implements AutoCloseable {
                     journal.write(buffer);
                 }
                 journal.force(true);
+                journalEnd += buffer.capacity();
             } catch (IOException e) {
                 journalFailed = true;
-                log.error("Replay journal {} could not be written; every further settlement that would be "
-                        + "allowed is denied until railgate is restarted", journalPath, e);
-                throw new ReplayJournalException("replay journal " + journalPath + " could not be written", e);
+                String state = withdraw()
+                        ? "the record was removed again"
+                        : "THE RECORD MAY STILL BE IN THE FILE: truncate it to " + journalEnd
+                                + " bytes before restarting, or the denied settlement counts as allowed";
+                log.error("Replay journal {} could not be written; {}. Every further settlement that would "
+                        + "be allowed is denied until railgate is restarted", journalPath, state, e);
+                throw new ReplayJournalException("replay journal " + journalPath + " could not be written; "
+                        + state, e);
             }
+        }
+    }
+
+    /**
+     * Cuts the journal back to the end of its last complete record, so that
+     * the record of a settlement that was denied is not read as allowed at
+     * the next start-up.
+     *
+     * @return whether the file was truncated and synced
+     */
+    private boolean withdraw() {
+        try {
+            journal.truncate(journalEnd);
+            journal.force(true);
+            return true;
+        } catch (IOException e) {
+            return false;
         }
     }
 

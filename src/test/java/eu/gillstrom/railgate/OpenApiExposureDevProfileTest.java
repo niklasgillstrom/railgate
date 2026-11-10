@@ -45,5 +45,8 @@ class OpenApiExposureDevProfileTest {
     void swaggerUiIsServed() throws Exception {
         // springdoc answers /swagger-ui.html with a redirect to the bundled UI.
         mvc.perform(get("/swagger-ui.html")).andExpect(status().is3xxRedirection());
+        // The UI itself comes from springdoc's own handler, which does not
+        // depend on Spring Boot's static-resource mappings (off since 1.8.0).
+        mvc.perform(get("/swagger-ui/index.html")).andExpect(status().isOk());
     }
 }

@@ -20,3 +20,9 @@ springdoc:
     enabled: true
   swagger-ui:
     enabled: true
+    # The swagger-ui WebJar that pom.xml pins (org.webjars:swagger-ui). springdoc
+    # serves /swagger-ui/** from the WebJar directory of the version it was
+    # built with, 5.34.0 for springdoc 3.2.0; with the WebJar pinned to another
+    # version and this left unset, /swagger-ui.html redirected to a 404.
+    # OpenApiExposureDevProfileTest fails when the two versions differ.
+    version: 5.34.1

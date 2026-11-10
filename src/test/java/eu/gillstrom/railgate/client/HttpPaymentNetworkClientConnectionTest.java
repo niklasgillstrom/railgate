@@ -1,124 +1,95 @@
 package eu.gillstrom.railgate.client;
 
 import eu.gillstrom.railgate.signing.TrustedCertificates;
+import eu.gillstrom.railgate.testsupport.ReferenceOperator;
+import eu.gillstrom.railgate.testsupport.SilentServer;
 import eu.gillstrom.railgate.testsupport.TestKeys;
 import org.junit.jupiter.api.Test;
 
-import java.io.ByteArrayInputStream;
+import javax.net.ssl.SSLSession;
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
 import java.net.URI;
-import java.net.URL;
+import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Arrays;
 import java.util.List;
-import java.util.function.Consumer;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * How {@link HttpPaymentNetworkClient} uses its connection, observed through a
- * connection that never touches the network: the settings of the request,
- * which stream each status is read from, that every stream it opens is
- * drained and closed, and that a failed connection is disconnected.
+ * How {@link HttpPaymentNetworkClient} conducts one exchange with the
+ * operator: the request it sends, what it makes of each status and failure,
+ * and that it waits for an answer no longer than its read timeout. Most of it
+ * is observed through {@link HttpPaymentNetworkClient#send}, with an answer
+ * that never touches the network.
  */
 class HttpPaymentNetworkClientConnectionTest {
 
-    /** A status, the two streams, and what the client did with the connection. */
-    static final class FakeConnection extends HttpURLConnection {
-        int status = 404;
-        IOException failure;
-        RecordingStream errorStream = new RecordingStream(new byte[0]);
-        RecordingStream inputStream = new RecordingStream(new byte[0]);
-        boolean disconnected;
-        boolean inputRequested;
+    /** A status and a body. */
+    private record Answer(int statusCode, byte[] body, HttpRequest request) implements HttpResponse<byte[]> {
 
-        FakeConnection(URL url) {
-            super(url);
+        @Override
+        public Optional<HttpResponse<byte[]>> previousResponse() {
+            return Optional.empty();
         }
 
         @Override
-        public void connect() {
+        public HttpHeaders headers() {
+            return HttpHeaders.of(Map.of(), (name, value) -> true);
         }
 
         @Override
-        public boolean usingProxy() {
-            return false;
+        public Optional<SSLSession> sslSession() {
+            return Optional.empty();
         }
 
         @Override
-        public void disconnect() {
-            disconnected = true;
+        public URI uri() {
+            return request.uri();
         }
 
         @Override
-        public int getResponseCode() throws IOException {
-            if (failure != null) {
-                throw failure;
-            }
-            return status;
-        }
-
-        @Override
-        public InputStream getErrorStream() {
-            return status >= 400 ? errorStream : null;
-        }
-
-        @Override
-        public InputStream getInputStream() throws IOException {
-            inputRequested = true;
-            if (status >= 400) {
-                // As HttpURLConnection does for an error status.
-                throw new IOException("Server returned HTTP response code: " + status);
-            }
-            return inputStream;
+        public HttpClient.Version version() {
+            return HttpClient.Version.HTTP_1_1;
         }
     }
 
-    static final class RecordingStream extends ByteArrayInputStream {
-        boolean closed;
-
-        RecordingStream(byte[] bytes) {
-            super(bytes);
-        }
-
-        RecordingStream(String text) {
-            this(text.getBytes(StandardCharsets.UTF_8));
-        }
-
-        @Override
-        public void close() throws IOException {
-            closed = true;
-            super.close();
-        }
-
-        int remaining() {
-            return count - pos;
-        }
+    private static TrustedCertificates operatorTrust() {
+        return TrustedCertificates.of(List.of(TestKeys.certificate(TestKeys.OPERATOR_CERT)));
     }
 
-    private FakeConnection connection;
-    private URI requested;
-    private Consumer<FakeConnection> setUp = c -> { };
+    private HttpRequest requested;
+    private CompletableFuture<HttpResponse<byte[]>> pending;
 
-    private HttpPaymentNetworkClient client(String baseUrl) {
-        return new HttpPaymentNetworkClient(baseUrl, false, null, null, Duration.ofMillis(1500),
-                Duration.ofMillis(2500), TrustedCertificates.of(List.of(TestKeys.certificate(TestKeys.OPERATOR_CERT)))) {
+    /** A client whose exchanges are answered by {@code answer} instead of the network. */
+    private HttpPaymentNetworkClient client(String baseUrl, Duration readTimeout,
+                                            Function<HttpRequest, CompletableFuture<HttpResponse<byte[]>>> answer) {
+        return new HttpPaymentNetworkClient(baseUrl, false, null, null, Duration.ofMillis(1500), readTimeout,
+                operatorTrust()) {
             @Override
-            HttpURLConnection open(URI uri) throws IOException {
-                requested = uri;
-                connection = new FakeConnection(uri.toURL());
-                setUp.accept(connection);
-                return connection;
+            CompletableFuture<HttpResponse<byte[]>> send(HttpRequest request) {
+                requested = request;
+                pending = answer.apply(request);
+                return pending;
             }
         };
     }
 
-    private PaymentNetworkLookup lookup(Consumer<FakeConnection> setUp) {
-        this.setUp = setUp;
-        return client("https://operator.test").lookup("UETR-1");
+    private PaymentNetworkLookup lookup(int status, byte[] body) {
+        return client("https://operator.test", Duration.ofSeconds(5),
+                request -> CompletableFuture.completedFuture(new Answer(status, body, request))).lookup("UETR-1");
+    }
+
+    private PaymentNetworkLookup lookupFailingWith(Throwable failure) {
+        return client("https://operator.test", Duration.ofSeconds(5),
+                request -> CompletableFuture.failedFuture(failure)).lookup("UETR-1");
     }
 
     private static String unavailableDetail(PaymentNetworkLookup lookup) {
@@ -126,82 +97,160 @@ class HttpPaymentNetworkClientConnectionTest {
         return ((PaymentNetworkLookup.Unavailable) lookup).detail();
     }
 
-    @Test
-    void oneUncachedGetWithTheConfiguredTimeoutsNoRedirectsAndAJsonAcceptHeader() {
-        this.setUp = c -> { };
-        assertThat(client("https://operator.test/").lookup("UETR-1")).isInstanceOf(PaymentNetworkLookup.NotFound.class);
+    private static String invalidDetail(PaymentNetworkLookup lookup) {
+        assertThat(lookup).isInstanceOf(PaymentNetworkLookup.OperatorSignatureInvalid.class);
+        return ((PaymentNetworkLookup.OperatorSignatureInvalid) lookup).detail();
+    }
 
-        assertThat(requested).as("a trailing slash in the base URL is dropped")
+    @Test
+    void oneGetWithAJsonAcceptHeaderOverAConnectionThatFollowsNoRedirect() {
+        HttpPaymentNetworkClient client = client("https://operator.test/", Duration.ofMillis(2500),
+                request -> CompletableFuture.completedFuture(new Answer(404, new byte[0], request)));
+
+        assertThat(client.lookup("UETR-1")).isInstanceOf(PaymentNetworkLookup.NotFound.class);
+
+        assertThat(requested.uri()).as("a trailing slash in the base URL is dropped")
                 .isEqualTo(URI.create("https://operator.test/v1/payout-artefacts/UETR-1"));
-        assertThat(connection.getConnectTimeout()).isEqualTo(1500);
-        assertThat(connection.getReadTimeout()).isEqualTo(2500);
-        assertThat(connection.getInstanceFollowRedirects()).isFalse();
-        assertThat(connection.getUseCaches()).isFalse();
-        assertThat(connection.getRequestMethod()).isEqualTo("GET");
-        assertThat(connection.getRequestProperty("Accept")).isEqualTo("application/json");
+        assertThat(requested.method()).isEqualTo("GET");
+        assertThat(requested.headers().allValues("Accept")).containsExactly("application/json");
+        assertThat(client.http().connectTimeout()).contains(Duration.ofMillis(1500));
+        assertThat(client.http().followRedirects()).isEqualTo(HttpClient.Redirect.NEVER);
+        assertThat(client.http().version()).isEqualTo(HttpClient.Version.HTTP_1_1);
     }
 
     @Test
-    void notFoundDrainsAndClosesTheErrorStreamOrHasNoneToDrain() {
-        assertThat(lookup(c -> c.errorStream = new RecordingStream("{\"error\":\"unknown reference\"}")))
+    void anotherStatusThan200And404IsUnavailableAndNamed() {
+        for (int status : new int[] {400, 500, 302, 204, 201, 199}) {
+            assertThat(unavailableDetail(lookup(status, "ignored".getBytes(StandardCharsets.UTF_8))))
+                    .isEqualTo("operator answered HTTP " + status);
+        }
+        assertThat(lookup(404, "{\"error\":\"unknown reference\"}".getBytes(StandardCharsets.UTF_8)))
                 .isInstanceOf(PaymentNetworkLookup.NotFound.class);
-        assertThat(connection.errorStream.closed).isTrue();
-        assertThat(connection.errorStream.remaining()).isZero();
-        assertThat(connection.inputRequested).isFalse();
-
-        assertThat(lookup(c -> c.errorStream = null)).isInstanceOf(PaymentNetworkLookup.NotFound.class);
     }
 
     @Test
-    void anotherStatusDrainsTheStreamThatStatusComesOn() {
-        for (int status : new int[] {400, 500}) {
-            String detail = unavailableDetail(lookup(c -> {
-                c.status = status;
-                c.errorStream = new RecordingStream("error body");
-            }));
-            assertThat(detail).isEqualTo("operator answered HTTP " + status);
-            assertThat(connection.errorStream.closed).as("HTTP " + status).isTrue();
-            assertThat(connection.errorStream.remaining()).as("HTTP " + status).isZero();
-            assertThat(connection.inputRequested).as("HTTP " + status).isFalse();
+    void aFailedExchangeIsNamedByItsException() {
+        assertThat(unavailableDetail(lookupFailingWith(new IOException()))).isEqualTo("IOException");
+        assertThat(unavailableDetail(lookupFailingWith(new IOException("connection reset"))))
+                .isEqualTo("IOException: connection reset");
+    }
+
+    /**
+     * Until 1.7.0 the read timeout bounded each read, so an answer arriving a
+     * byte at a time was not bounded.
+     */
+    @Test
+    void anAnswerThatIsNotCompleteWithinTheReadTimeoutIsUnavailableAndAbandoned() {
+        HttpPaymentNetworkClient client = client("https://operator.test", Duration.ofMillis(200),
+                request -> new CompletableFuture<>());
+
+        long started = System.nanoTime();
+        String detail = unavailableDetail(client.lookup("UETR-1"));
+        long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+
+        assertThat(detail).isEqualTo("no complete answer within PT0.2S");
+        assertThat(elapsedMillis).isBetween(150L, 5_000L);
+        assertThat(pending.isCancelled()).as("the exchange is abandoned, not left running").isTrue();
+    }
+
+    @Test
+    void anInterruptedLookupIsUnavailableAbandonsTheExchangeAndStaysInterrupted() {
+        HttpPaymentNetworkClient client = client("https://operator.test", Duration.ofSeconds(30),
+                request -> new CompletableFuture<>());
+
+        Thread.currentThread().interrupt();
+        String detail;
+        boolean stillInterrupted;
+        try {
+            detail = unavailableDetail(client.lookup("UETR-1"));
+        } finally {
+            stillInterrupted = Thread.interrupted();
         }
 
-        String detail = unavailableDetail(lookup(c -> {
-            c.status = 302;
-            c.inputStream = new RecordingStream("moved");
-        }));
-        assertThat(detail).isEqualTo("operator answered HTTP 302");
-        assertThat(connection.inputStream.closed).isTrue();
-        assertThat(connection.inputStream.remaining()).isZero();
+        assertThat(detail).isEqualTo("interrupted while waiting for the operator");
+        assertThat(stillInterrupted).as("the caller can still see that it was interrupted").isTrue();
+        assertThat(pending.isCancelled()).isTrue();
     }
 
     @Test
-    void aFailedExchangeIsDisconnectedAndNamedByItsException() {
-        assertThat(unavailableDetail(lookup(c -> c.failure = new IOException()))).isEqualTo("IOException");
-        assertThat(connection.disconnected).isTrue();
-
-        assertThat(unavailableDetail(lookup(c -> c.failure = new IOException("connection reset"))))
-                .isEqualTo("IOException: connection reset");
-        assertThat(connection.disconnected).isTrue();
-    }
-
-    @Test
-    void aBodyOfExactlyTheLimitIsReadAndOneByteMoreIsRefused() {
-        byte[] atLimit = new byte[HttpPaymentNetworkClient.MAX_RESPONSE_BYTES];
-        Arrays.fill(atLimit, (byte) ' ');
-
-        PaymentNetworkLookup read = lookup(c -> {
-            c.status = 200;
-            c.inputStream = new RecordingStream(atLimit);
-        });
-        assertThat(read).isInstanceOf(PaymentNetworkLookup.OperatorSignatureInvalid.class);
-        assertThat(((PaymentNetworkLookup.OperatorSignatureInvalid) read).detail()).doesNotContain("exceeds");
-
-        PaymentNetworkLookup refused = lookup(c -> {
-            c.status = 200;
-            c.inputStream = new RecordingStream(Arrays.copyOf(atLimit, atLimit.length + 1));
-        });
-        assertThat(((PaymentNetworkLookup.OperatorSignatureInvalid) refused).detail())
+    void anAnswerWhoseBodyWasAbandonedAtTheLimitIsRefusedAndAnyOtherBodyIsVerified() {
+        assertThat(invalidDetail(lookup(200, null)))
                 .isEqualTo("response body exceeds " + HttpPaymentNetworkClient.MAX_RESPONSE_BYTES + " bytes");
+        assertThat(invalidDetail(lookup(200, "[]".getBytes(StandardCharsets.UTF_8))))
+                .isEqualTo("response body is not a JSON object");
+    }
+
+    @Test
+    void aBaseUrlTheClientCannotCallIsUnavailableWithoutAnExchange() {
+        String detail = unavailableDetail(client("https://operator.test/a b", Duration.ofSeconds(5),
+                request -> CompletableFuture.completedFuture(new Answer(200, new byte[0], request))).lookup("UETR-1"));
+
+        assertThat(detail).startsWith("IllegalArgumentException: ");
+        assertThat(pending).as("nothing was sent").isNull();
+    }
+
+    /**
+     * As a path segment "." and ".." name a directory. A server or proxy that
+     * resolves them answers for {@code /v1/payout-artefacts/} or {@code /v1/},
+     * not for a payout.
+     */
+    @Test
+    void aReferenceThatIsADotSegmentIsNotRequested() {
+        HttpPaymentNetworkClient client = client("https://operator.test", Duration.ofSeconds(5),
+                request -> CompletableFuture.completedFuture(new Answer(404, new byte[0], request)));
+        for (String reference : new String[] {".", ".."}) {
+            assertThat(client.lookup(reference)).as(reference).isInstanceOf(PaymentNetworkLookup.NotFound.class);
+            assertThat(requested).as(reference).isNull();
+        }
+
+        client.lookup("...");
+        assertThat(requested.uri()).as("three dots are an ordinary segment")
+                .isEqualTo(URI.create("https://operator.test/v1/payout-artefacts/..."));
+        client.lookup(".a");
+        assertThat(requested.uri()).isEqualTo(URI.create("https://operator.test/v1/payout-artefacts/.a"));
+    }
+
+    // ---- over a real connection ---------------------------------------------------
+
+    private static HttpPaymentNetworkClient overTheNetwork(String baseUrl, Duration readTimeout) {
+        return new HttpPaymentNetworkClient(baseUrl, true, null, null, Duration.ofSeconds(2), readTimeout,
+                operatorTrust());
+    }
+
+    @Test
+    void aBodyOfExactlyTheLimitIsReadAndOneByteMoreIsRefused() throws Exception {
+        try (ReferenceOperator operator = ReferenceOperator.start()) {
+            operator.register(new ReferenceOperator.Artefacts("UETR-1", "PAYOUT-1", "0x00C0FFEE",
+                    "CN=Example CA, O=Example Bank, C=SE", "ab".repeat(64), "c2lnbmF0dXJl", "2026-10-30T12:00:00Z"));
+            HttpPaymentNetworkClient client = overTheNetwork(operator.baseUrl(), Duration.ofSeconds(5));
+
+            operator.rawBody = " ".repeat(HttpPaymentNetworkClient.MAX_RESPONSE_BYTES);
+            assertThat(invalidDetail(client.lookup("UETR-1"))).as("read in full, and then not JSON")
+                    .doesNotContain("exceeds");
+
+            operator.rawBody = " ".repeat(HttpPaymentNetworkClient.MAX_RESPONSE_BYTES + 1);
+            assertThat(invalidDetail(client.lookup("UETR-1")))
+                    .isEqualTo("response body exceeds " + HttpPaymentNetworkClient.MAX_RESPONSE_BYTES + " bytes");
+        }
+    }
+
+    @Test
+    void anAnswerThatArrivesAByteAtATimeIsUnavailableWhenTheReadTimeoutIsUp() throws Exception {
+        String[] heads = {
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 60000\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nX-Slow: "};
+        for (String head : heads) {
+            try (SilentServer dripping = SilentServer.dripping(head, 50)) {
+                HttpPaymentNetworkClient client = overTheNetwork(dripping.baseUrl(), Duration.ofMillis(500));
+
+                long started = System.nanoTime();
+                String detail = unavailableDetail(client.lookup("UETR-1"));
+                long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+
+                assertThat(detail).isEqualTo("no complete answer within PT0.5S");
+                assertThat(elapsedMillis).isBetween(400L, 10_000L);
+            }
+        }
     }
 
     @Test

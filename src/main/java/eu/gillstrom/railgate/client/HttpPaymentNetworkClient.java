@@ -11,7 +11,6 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.boot.ssl.SslBundle;
 import org.springframework.boot.ssl.SslBundles;
 import org.springframework.stereotype.Component;
 import tools.jackson.core.JacksonException;
@@ -19,17 +18,18 @@ import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLSocketFactory;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
 /**
@@ -65,19 +65,27 @@ import java.util.regex.Pattern;
  * </ol>
  *
  * <p><b>What else happens.</b> 404 is {@link PaymentNetworkLookup.NotFound}
- * ({@code DORA_32_AUDIT_MISSING}). Any other status, a redirect, a connect or
- * read timeout, a TLS failure or any other I/O error is
- * {@link PaymentNetworkLookup.Unavailable} ({@code NETWORK_ERROR}). Nothing in
- * the 404 or error bodies is read for meaning.</p>
+ * ({@code DORA_32_AUDIT_MISSING}). Any other status, a redirect, a connect
+ * timeout, an answer that is not complete within
+ * {@code railgate.payment-network.read-timeout}, a TLS failure or any other
+ * I/O error is {@link PaymentNetworkLookup.Unavailable}
+ * ({@code NETWORK_ERROR}). Nothing in the 404 or error bodies is read for
+ * meaning. The references {@code .} and {@code ..} are never requested: as a
+ * path segment each names a directory, which a server or proxy resolves away,
+ * so the request would reach another path than the one asked for. They are
+ * answered {@link PaymentNetworkLookup.NotFound} without a call.</p>
  *
  * <p><b>Transport.</b> {@code railgate.payment-network.base-url} must be
  * {@code https://} unless {@code railgate.payment-network.allow-insecure-http}
  * is {@code true}, which logs a WARN at start-up. The client certificate for
  * mTLS and the truststore come from the Spring Boot SSL bundle named by
  * {@code railgate.payment-network.ssl-bundle}, or from the JVM defaults when it
- * is empty. As for {@code GatekeeperClient}, the connection is
- * {@code HttpURLConnection}, so a bundle that sets ciphers or protocols is
- * refused at start-up, and hostname verification is the JDK default.</p>
+ * is empty. As for {@code GatekeeperClient}, the connection is the JDK's
+ * {@code HttpClient} ({@link OutboundHttp}): HTTP/1.1, no redirect followed, a
+ * bundle that sets ciphers or protocols refused at start-up, and hostname
+ * verification the JDK default. {@code connect-timeout} bounds the connect and
+ * {@code read-timeout} the whole exchange, from the request to the last byte
+ * of the answer; until 1.7.0 it bounded each read.</p>
  *
  * <p><b>What this does not establish.</b> A verified answer proves that a
  * holder of a pinned operator key produced it. It does not show that the
@@ -104,9 +112,8 @@ public class HttpPaymentNetworkClient implements PaymentNetworkClient {
     private static final int MAX_LOGGED_REFERENCE_LENGTH = 128;
 
     private final String baseUrl;
-    private final int connectTimeoutMillis;
-    private final int readTimeoutMillis;
-    private final SSLSocketFactory socketFactory;
+    private final Duration readTimeout;
+    private final HttpClient http;
     private final TrustedCertificates trustedOperatorCertificates;
     private final JsonMapper json = JsonMapper.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
@@ -158,9 +165,10 @@ public class HttpPaymentNetworkClient implements PaymentNetworkClient {
                     + "This configuration MUST NOT be deployed.", url);
         }
         this.baseUrl = url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
-        this.connectTimeoutMillis = positiveMillis(connectTimeout, "railgate.payment-network.connect-timeout");
-        this.readTimeoutMillis = positiveMillis(readTimeout, "railgate.payment-network.read-timeout");
-        this.socketFactory = socketFactory(sslBundle, sslBundles);
+        this.readTimeout = OutboundHttp.positive(readTimeout, "railgate.payment-network.read-timeout");
+        this.http = OutboundHttp.client(
+                OutboundHttp.positive(connectTimeout, "railgate.payment-network.connect-timeout"),
+                OutboundHttp.sslContext("railgate.payment-network.ssl-bundle", sslBundle, sslBundles));
         if (trustedOperatorCertificates == null || trustedOperatorCertificates.isEmpty()) {
             throw new IllegalStateException("railgate.payment-network.mode=http requires at least one "
                     + "trusted operator certificate in railgate.payment-network.trusted-keys");
@@ -179,33 +187,6 @@ public class HttpPaymentNetworkClient implements PaymentNetworkClient {
         return TrustedCertificates.load(location, "railgate.payment-network.trusted-keys");
     }
 
-    private static int positiveMillis(Duration duration, String property) {
-        if (duration == null || duration.isZero() || duration.isNegative()) {
-            // HttpURLConnection reads 0 as "wait forever".
-            throw new IllegalStateException(property + " must be a positive duration");
-        }
-        return (int) Math.min(Integer.MAX_VALUE, duration.toMillis() == 0 ? 1 : duration.toMillis());
-    }
-
-    private static SSLSocketFactory socketFactory(String sslBundle, SslBundles sslBundles) {
-        if (sslBundle == null || sslBundle.isBlank()) {
-            return null;
-        }
-        String bundleName = sslBundle.trim();
-        if (sslBundles == null) {
-            throw new IllegalStateException("railgate.payment-network.ssl-bundle is '" + bundleName
-                    + "' but no SSL bundle registry is available.");
-        }
-        SslBundle bundle = sslBundles.getBundle(bundleName);
-        if (bundle.getOptions() != null && bundle.getOptions().isSpecified()) {
-            throw new IllegalStateException("SSL bundle '" + bundleName + "' sets ciphers or "
-                    + "enabled protocols. The payment-network connection uses HttpURLConnection, "
-                    + "which cannot apply them; remove the bundle's options or use a bundle "
-                    + "without them.");
-        }
-        return bundle.createSslContext().getSocketFactory();
-    }
-
     @Override
     public Optional<PaymentSignature> getSignature(String transactionReference) {
         return lookup(transactionReference) instanceof PaymentNetworkLookup.Found found
@@ -218,51 +199,67 @@ public class HttpPaymentNetworkClient implements PaymentNetworkClient {
         if (transactionReference == null || transactionReference.isBlank()) {
             return new PaymentNetworkLookup.NotFound();
         }
-        HttpURLConnection connection = null;
-        byte[] body;
-        try {
-            URI uri = URI.create(baseUrl + PATH + encodePathSegment(transactionReference));
-            connection = open(uri);
-            if (socketFactory != null && connection instanceof HttpsURLConnection https) {
-                https.setSSLSocketFactory(socketFactory);
-            }
-            connection.setConnectTimeout(connectTimeoutMillis);
-            connection.setReadTimeout(readTimeoutMillis);
-            connection.setInstanceFollowRedirects(false);
-            connection.setUseCaches(false);
-            // GET is HttpURLConnection's default request method.
-            connection.setRequestProperty("Accept", "application/json");
-
-            int status = connection.getResponseCode();
-            if (status == 404) {
-                drain(connection.getErrorStream());
-                return new PaymentNetworkLookup.NotFound();
-            }
-            if (status != 200) {
-                drain(status >= 400 ? connection.getErrorStream() : connection.getInputStream());
-                return unavailable(transactionReference, "operator answered HTTP " + status);
-            }
-            try (InputStream in = connection.getInputStream()) {
-                body = readBounded(in);
-            }
-        } catch (IOException | RuntimeException e) {
-            // RuntimeException covers what URI and HttpURLConnection throw
-            // outside IOException (e.g. a base URL that is not a valid URI).
-            if (connection != null) {
-                connection.disconnect();
-            }
-            return unavailable(transactionReference, e.getClass().getSimpleName()
-                    + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+        if (transactionReference.equals(".") || transactionReference.equals("..")) {
+            log.warn("Payment-network operator not asked for ref={}: as a path segment it names a "
+                    + "directory, not a payout", transactionReference);
+            return new PaymentNetworkLookup.NotFound();
         }
+        HttpRequest request;
+        try {
+            request = HttpRequest.newBuilder(URI.create(baseUrl + PATH + encodePathSegment(transactionReference)))
+                    .header("Accept", "application/json")
+                    .GET()
+                    .build();
+        } catch (IllegalArgumentException e) {
+            // A base URL that is not a valid URI, or not one the client can call.
+            return unavailable(transactionReference, describe(e));
+        }
+        CompletableFuture<HttpResponse<byte[]>> pending = send(request);
+        HttpResponse<byte[]> response;
+        try {
+            response = pending.get(readTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            pending.cancel(true);
+            return unavailable(transactionReference, "no complete answer within " + readTimeout);
+        } catch (InterruptedException e) {
+            pending.cancel(true);
+            Thread.currentThread().interrupt();
+            return unavailable(transactionReference, "interrupted while waiting for the operator");
+        } catch (ExecutionException e) {
+            return unavailable(transactionReference, describe(e.getCause()));
+        }
+        int status = response.statusCode();
+        if (status == 404) {
+            return new PaymentNetworkLookup.NotFound();
+        }
+        if (status != 200) {
+            return unavailable(transactionReference, "operator answered HTTP " + status);
+        }
+        byte[] body = response.body();
         if (body == null) {
             return invalid(transactionReference, "response body exceeds " + MAX_RESPONSE_BYTES + " bytes");
         }
         return verify(transactionReference, body);
     }
 
-    /** Opens the connection for one lookup. Package-private so tests can observe how it is set up. */
-    HttpURLConnection open(URI uri) throws IOException {
-        return (HttpURLConnection) uri.toURL().openConnection();
+    /**
+     * Sends one request. The future completes when the whole answer has
+     * arrived, with a {@code null} body if it is longer than
+     * {@value #MAX_RESPONSE_BYTES} bytes, and cancelling it abandons the
+     * exchange. Package-private so tests can supply the answer.
+     */
+    CompletableFuture<HttpResponse<byte[]>> send(HttpRequest request) {
+        return http.sendAsync(request, info -> new OutboundHttp.LimitedBody(MAX_RESPONSE_BYTES));
+    }
+
+    /** The client the requests are sent with. Package-private for tests. */
+    HttpClient http() {
+        return http;
+    }
+
+    private static String describe(Throwable failure) {
+        return failure.getClass().getSimpleName()
+                + (failure.getMessage() == null ? "" : ": " + failure.getMessage());
     }
 
     /** Parses and authenticates a 200 body. Package-private for tests. */
@@ -344,32 +341,6 @@ public class HttpPaymentNetworkClient implements PaymentNetworkClient {
     private static String string(JsonNode root, String property) {
         JsonNode node = root.get(property);
         return node != null && node.isString() ? node.stringValue() : null;
-    }
-
-    private static byte[] readBounded(InputStream in) throws IOException {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        int total = 0;
-        int n;
-        while ((n = in.read(buffer)) != -1) {
-            total += n;
-            if (total > MAX_RESPONSE_BYTES) {
-                return null;
-            }
-            out.write(buffer, 0, n);
-        }
-        return out.toByteArray();
-    }
-
-    private static void drain(InputStream in) {
-        if (in == null) {
-            return;
-        }
-        try (in) {
-            in.skipNBytes(Math.min(in.available(), MAX_RESPONSE_BYTES));
-        } catch (IOException ignored) {
-            // The status already decided the outcome.
-        }
     }
 
     private static PaymentNetworkLookup unavailable(String reference, String detail) {

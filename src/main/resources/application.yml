@@ -15,6 +15,14 @@ server:
 spring:
   application:
     name: railgate
+  web:
+    resources:
+      # railgate serves an API and no static files. Left at its default, Spring
+      # Boot maps /webjars/** to every WebJar on the class path, and the
+      # swagger-ui package that springdoc depends on was served there in every
+      # profile, whatever springdoc.swagger-ui.enabled says. In the dev profile
+      # springdoc serves the UI through its own handler.
+      add-mappings: false
 
 # OpenAPI document and Swagger UI are off in every non-dev profile. Neither has
 # a run-time function in this service, and the UI is a third-party JavaScript
@@ -58,6 +66,8 @@ railgate:
     # Name of a Spring Boot SSL bundle (spring.ssl.bundle.*) holding the client
     # certificate for mTLS and the truststore for the operator. Empty: JVM defaults.
     # ssl-bundle: payment-network
+    # connect-timeout bounds the connect; read-timeout bounds the whole exchange
+    # after it, up to the last byte of the answer. Both greater than zero.
     connect-timeout: PT2S
     read-timeout: PT5S
     # PEM file (classpath:, file: or a plain path) with the operator's signing
@@ -85,7 +95,10 @@ railgate:
     allow-insecure-http: false
 
     # Bounded waits. A settlement rail must receive a deny rather than block on
-    # an unresponsive gatekeeper. ISO-8601 durations.
+    # an unresponsive gatekeeper. ISO-8601 durations, each greater than zero.
+    # connect-timeout bounds the connect; read-timeout bounds everything after
+    # it, up to the last byte of the answer, so that an answer arriving a byte
+    # at a time ends in a NETWORK_ERROR deny as well.
     connect-timeout: PT2S
     read-timeout: PT5S
 

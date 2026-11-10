@@ -290,8 +290,12 @@ originating bank receives a structured reason code. This is the complete
 set of reason codes railgate can produce — no other value is reachable.
 Responses that never reach the settlement logic carry no reason code: 401
 from Spring Security for a request without valid HTTP Basic credentials,
-and 413 (`{"error":"request_too_large"}`) from `RequestSizeLimitFilter` for
-an oversized body. A pipeline must treat both as a deny.
+413 (`{"error":"request_too_large"}`) from `RequestSizeLimitFilter` for
+an oversized body, and 406 for a request whose `Accept` header excludes
+`application/json`. A pipeline must treat all three as a deny. *(1.8.0:
+until then a request with such an `Accept` header was evaluated, recorded
+and, when allowed, entered in the replay record before it was answered 406;
+it is now refused before anything is evaluated.)*
 
 | Reason code                | HTTP | allow | Meaning                                                            |
 |----------------------------|------|-------|--------------------------------------------------------------------|
@@ -310,7 +314,7 @@ an oversized body. A pipeline must treat both as a deny.
 | CERT_DECOMMISSIONED        | 403  | false | The signature verifies, but the certificate's key was decommissioned by a key-lifecycle event at the gatekeeper (gatekeeper 1.7.0). |
 | MALFORMED_INPUT            | 403  | false | The gatekeeper could not parse the request. Not a signature failure. |
 | ALGORITHM_NOT_SUPPORTED    | 403  | false | The gatekeeper would not run the signature algorithm. Not a signature failure. |
-| NETWORK_ERROR              | 403  | false | gatekeeper unreachable, timed out, or returned an unusable body; in `http` mode also the payment-network operator unreachable, timed out, failing TLS, redirecting, or answering any status other than 200 and 404 (the message says which). |
+| NETWORK_ERROR              | 403  | false | gatekeeper unreachable, timed out, answering a status other than 2xx *(1.8.0; until then only 4xx and 5xx, and the body of a 3xx answer was read as a verdict)* or more than 65 536 bytes, or returning an unusable body; in `http` mode also the payment-network operator unreachable, timed out, failing TLS, redirecting, or answering any status other than 200 and 404 (the message says which). |
 | VERDICT_SIGNATURE_INVALID  | 403  | false | *(1.7.0)* The gatekeeper's verdict was not accepted: unsigned while `railgate.gatekeeper.require-signed-verdict=true`, signature fields incomplete, key not in `railgate.gatekeeper.trusted-keys`, algorithm outside the allow-list, signature not verifying over the request railgate sent, an echoed field differing from it, or an unparseable `verifiedAt`. The gatekeeper was called, but its references are discarded. |
 | VERDICT_STALE              | 403  | false | *(1.7.0)* The verdict's signature verifies, but `verifiedAt` is more than `railgate.gatekeeper.verdict-max-skew` from railgate's clock, in either direction. |
 | INVALID_SIGNATURE_MATERIAL | 403  | false | The artefacts from the payment-network operator are malformed or outside the wire contract above (digest not 128 hex characters, signature not base64 or over 4096 characters, certificate serial not hexadecimal or over 128 characters, issuer DN not an RFC 4514 name or over 512 characters, any of them blank). The gatekeeper was not called. |
@@ -341,7 +345,7 @@ valid data, the transaction does not settle.
 mvn -B clean verify                          # build + tests
 NVD_API_KEY=... mvn -B -Powasp verify   # OWASP Dependency-Check scan
 mvn spring-boot:run -Dspring-boot.run.profiles=dev   # local run without TLS, port 8082
-java -jar target/railgate-1.7.0.jar          # deployed: needs server.ssl (see below)
+java -jar target/railgate-1.8.0.jar          # deployed: needs server.ssl (see below)
 ```
 
 railgate does not start without TLS on its own listener
@@ -363,12 +367,12 @@ Configuration via `application.yml`:
 | `railgate.payment-network.allow-insecure-http` | `false`               | Permit an `http://` operator base URL; logs a WARN. Local development only. |
 | `railgate.payment-network.ssl-bundle`       | *(empty)*                | Spring Boot SSL bundle with the mTLS client certificate and the truststore for the operator. Empty means JVM defaults; a bundle with ciphers or protocols set is refused at start-up. |
 | `railgate.payment-network.connect-timeout`  | `PT2S`                   | Connect timeout for the operator; must be positive. |
-| `railgate.payment-network.read-timeout`     | `PT5S`                   | Read timeout for the operator; must be positive. |
+| `railgate.payment-network.read-timeout`     | `PT5S`                   | Time allowed for the operator's whole answer, from the request to its last byte; must be positive. Until 1.7.0 it bounded each read, not the answer. |
 | `railgate.payment-network.trusted-keys`     | *(empty)*                | `http` mode, required: PEM file (`classpath:`, `file:` or a path) with the operator's signing certificate(s). Missing, unreadable or empty stops start-up. |
 | `railgate.gatekeeper.base-url`              | `https://localhost:8443` | Supervisor's gatekeeper instance URL. Must be `https://` unless the flag below is set. |
 | `railgate.gatekeeper.allow-insecure-http`   | `false`                  | Permit a non-`https` base URL. Local development only — start-up fails without it, and logs a WARN with it. |
-| `railgate.gatekeeper.connect-timeout`       | `PT2S`                   | TCP connect timeout for gatekeeper calls (ISO-8601 duration)            |
-| `railgate.gatekeeper.read-timeout`          | `PT5S`                   | Response read timeout for gatekeeper calls (ISO-8601 duration). Exceeding either yields `NETWORK_ERROR` and a deny. |
+| `railgate.gatekeeper.connect-timeout`       | `PT2S`                   | TCP connect timeout for gatekeeper calls (ISO-8601 duration); must be positive. |
+| `railgate.gatekeeper.read-timeout`          | `PT5S`                   | Time allowed for the gatekeeper's whole answer, from the request to its last byte (ISO-8601 duration); must be positive. Exceeding either yields `NETWORK_ERROR` and a deny, as do an answer over 65 536 bytes and any status other than 2xx. Until 1.7.0 this timeout bounded each read, not the answer, and zero meant no timeout. |
 | `railgate.gatekeeper.ssl-bundle`            | *(empty)*                | Name of a Spring Boot SSL bundle (`spring.ssl.bundle.*`) whose trust and key material is used for the gatekeeper connection. Empty means the JVM default SSL context. An unknown name fails start-up. |
 | `railgate.gatekeeper.trusted-keys`          | *(empty)*                | *(1.7.0)* PEM file with the gatekeeper's verdict-signing certificate(s) — the certificate `GET /v1/gatekeeper/keys` publishes. Set but unreadable or without a certificate stops start-up; empty with a signature required starts with a WARN and denies every settlement that reaches the gatekeeper. |
 | `railgate.gatekeeper.require-signed-verdict` | `true` (`false` in `dev`) | *(1.7.0)* Require a signed gatekeeper verdict. `false` logs a WARN ("MUST NOT be deployed"). |
@@ -390,8 +394,8 @@ downgrade. Trust and key material come from one of two places:
   `railgate.gatekeeper.ssl-bundle=<name>`. `GatekeeperClient` resolves the
   bundle at start-up and uses its `SSLContext` for every gatekeeper
   connection. gatekeeper's `SETTLEMENT_RAIL` role is bound to the client
-  certificate's CN. Two limits: the connection is made with the JDK
-  `HttpURLConnection`, so a bundle that sets `options.ciphers` or
+  certificate's CN. Two limits: railgate applies the bundle's key and
+  trust material only, so a bundle that sets `options.ciphers` or
   `options.enabled-protocols` is refused at start-up rather than silently
   ignored; and the context is built once, so a bundle with
   `reload-on-update: true` takes effect for railgate only at the next
@@ -428,7 +432,11 @@ verdict. `GatekeeperClient` (`VerdictVerifier`) checks, in this order:
    `certSerial`, `issuerDn` and `digestHex` railgate **sent** (normalised:
    serial without `0x`/`0X` as lower-case hex without leading zeros, issuer
    in RFC 2253 form, digest lower-cased) and the other fields of the
-   verdict, so a verdict signed for any other request does not verify;
+   verdict, so a verdict signed for other identifiers or another digest
+   does not verify (the form does not cover the signature bytes or a
+   certificate added to the request; gatekeeper 1.8.0 or later looks
+   the certificate up under `certSerial` and `issuerDn` in every case, see
+   `THREAT_MODEL.md`);
 5. any echoed `certSerial`, `issuerDn` or `digestHex` equals what was sent;
 6. `verifiedAt` parses as an instant;
 7. `|now − verifiedAt|` is at most `railgate.gatekeeper.verdict-max-skew`.
@@ -462,14 +470,19 @@ still apply. See `THREAT_MODEL.md`.
 operator.
 
 **Inbound, settlement rail → railgate.** `SecurityConfig` requires
-authentication on `/api/v1/**` with CSRF disabled and sessions stateless;
-everything else keeps Spring Boot's default posture. The mechanism is the
-deployer's choice and is not fixed by this repo:
+authentication on every path, with CSRF disabled and sessions stateless:
+one filter chain for `/api/v1/**` and everything else alike (no form login,
+no logout endpoint). A request without credentials is answered `401` and
+leaves no session behind. *(Changed 1.8.0: until then everything outside
+`/api/v1/**` was behind a second chain that kept Spring Boot's default
+posture — form login and sessions — and each unauthenticated request to
+such a path created a server session that lived for 30 minutes.)* The
+mechanism is the deployer's choice and is not fixed by this repo:
 
 - **mTLS** (what a central-bank deployment should use). Configure
   `server.ssl.client-auth=need` with a truststore holding the settlement
-  system's CA, then replace `.httpBasic(...)` on the `/api/v1/**` chain
-  with `.x509(x509 -> x509.x509PrincipalExtractor(...))`. gatekeeper's
+  system's CA, then replace `.httpBasic(...)` on the chain with
+  `.x509(x509 -> x509.x509PrincipalExtractor(...))`. gatekeeper's
   `SecurityConfig` shows the full arrangement including principal
   extraction and role mapping.
 - **HTTP Basic** (what ships). Usable immediately; Spring Boot generates a
@@ -492,7 +505,11 @@ participation conditions, and `HttpPaymentNetworkClient`
   TLS (stated in the description and marked `x-mutual-tls-required`;
   OpenAPI 3.0 has no mTLS security scheme). railgate percent-encodes every
   octet of the reference except `A-Z a-z 0-9 - . _ ~`, follows no
-  redirects and applies the configured timeouts.
+  redirects and applies the configured timeouts. It does not request the
+  references `.` and `..` *(1.8.0)*: as a path segment each names a
+  directory, which a server or proxy resolves away, so the request would
+  reach another path. They are answered `DORA_32_AUDIT_MISSING` without a
+  call.
 - 200 answers `PayoutArtefacts`: `transactionReference`,
   `payoutInstructionId` (the operator's own identifier, 1–64 printable
   ASCII characters), `certSerial`, `issuerDn`, `digestHex`,
@@ -564,6 +581,12 @@ cannot be allowed again.
 `/swagger-ui.html` and `/v3/api-docs` are served only with
 `--spring.profiles.active=dev` (`application-dev.yml`); every other profile
 has `springdoc.api-docs.enabled=false` and `springdoc.swagger-ui.enabled=false`.
+The Swagger UI package itself is not served under `/webjars/**` in any
+profile (`spring.web.resources.add-mappings=false`). *(1.8.0: until then
+Spring Boot's default mapping served it there in every profile, to any
+authenticated caller, and in the `dev` profile `/swagger-ui.html` redirected
+to a page that was not found, because springdoc looked for another version
+of the package than the one `pom.xml` pins.)*
 
 Sample precheck request. `transactionReference`, `debtorIsOrganization`
 and `creditorIsPrivatePerson` are required; omitting either flag is a 400,

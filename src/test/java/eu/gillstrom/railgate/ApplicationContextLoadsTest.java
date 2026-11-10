@@ -52,9 +52,9 @@ class ApplicationContextLoadsTest {
     }
 
     @Test
-    void theSecurityFilterChainsAreBuilt() {
+    void theSecurityFilterChainIsBuilt() {
         assertThat(context.getBeansOfType(SecurityFilterChain.class))
-                .as("one chain for the stateless /api/v1/** API, one for everything else")
-                .hasSize(2);
+                .as("one stateless chain for every path")
+                .hasSize(1);
     }
 }

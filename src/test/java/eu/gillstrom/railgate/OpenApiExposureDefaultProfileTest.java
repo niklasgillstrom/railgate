@@ -4,11 +4,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.context.WebApplicationContext;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -53,5 +56,26 @@ class OpenApiExposureDefaultProfileTest {
     void swaggerUiIsNotServed() throws Exception {
         mvc.perform(get("/swagger-ui.html")).andExpect(status().isNotFound());
         mvc.perform(get("/swagger-ui/index.html")).andExpect(status().isNotFound());
+    }
+
+    /**
+     * The swagger-ui package is a WebJar on the class path, and Spring Boot
+     * maps {@code /webjars/**} to every WebJar by default, whatever
+     * {@code springdoc.swagger-ui.enabled} says. Until 1.7.0 the package was
+     * served there in every profile.
+     */
+    @Test
+    void theSwaggerUiPackageIsNotServedAsAWebJarEither() throws Exception {
+        Resource[] packaged = new PathMatchingResourcePatternResolver()
+                .getResources("classpath*:META-INF/resources/webjars/swagger-ui/*/index.html");
+        assertThat(packaged).as("the package is on the class path, so the paths below are real").isNotEmpty();
+
+        for (Resource resource : packaged) {
+            String url = resource.getURL().toString();
+            String path = url.substring(url.indexOf("/webjars/"));
+            mvc.perform(get(path)).andExpect(status().isNotFound());
+            mvc.perform(get(path.replace("index.html", "swagger-ui-bundle.js"))).andExpect(status().isNotFound());
+        }
+        mvc.perform(get("/webjars/swagger-ui/index.html")).andExpect(status().isNotFound());
     }
 }
